@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_URL="${BASE_URL:-https://你的域名}"
+BASE_URL="${BASE_URL:-https://raw.githubusercontent.com/Dincks/borrow-net/main}"
 BIN_NAME="borrow-net"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 TARGET="${INSTALL_DIR}/${BIN_NAME}"
@@ -31,14 +31,12 @@ chmod +x "$tmp"
 mv "$tmp" "$TARGET"
 
 case ":$PATH:" in
-  *":$INSTALL_DIR:"*)
-    ;;
+  *":$INSTALL_DIR:"*) ;;
   *)
     echo
     echo "[WARN] 你的 PATH 里还没有 ${INSTALL_DIR}"
-    echo "请执行下面任一命令后重新打开终端："
+    echo "请执行："
     echo "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ~/.bashrc && source ~/.bashrc"
-    echo "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ~/.zshrc && source ~/.zshrc"
     ;;
 esac
 
