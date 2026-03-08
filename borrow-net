@@ -128,11 +128,15 @@ RC
 done
 
 if command -v sudo >/dev/null 2>&1; then
-  sudo mkdir -p /etc/apt/apt.conf.d
-  sudo tee /etc/apt/apt.conf.d/95borrow-net >/dev/null <<APT
+  if sudo -n true >/dev/null 2>&1; then
+    sudo mkdir -p /etc/apt/apt.conf.d
+    sudo tee /etc/apt/apt.conf.d/95borrow-net >/dev/null <<APT
 Acquire::http::Proxy "${proxy_url}/";
 Acquire::https::Proxy "${proxy_url}/";
 APT
+  else
+    echo "[WARN] sudo 需要密码，已跳过 apt 代理配置"
+  fi
 fi
 
 if command -v npm >/dev/null 2>&1; then
@@ -159,7 +163,11 @@ for rc in "$HOME/.bashrc" "$HOME/.profile"; do
 done
 
 if command -v sudo >/dev/null 2>&1; then
-  sudo rm -f /etc/apt/apt.conf.d/95borrow-net
+  if sudo -n true >/dev/null 2>&1; then
+    sudo rm -f /etc/apt/apt.conf.d/95borrow-net
+  else
+    echo "[WARN] sudo 需要密码，已跳过 apt 代理清理"
+  fi
 fi
 
 if command -v npm >/dev/null 2>&1; then
