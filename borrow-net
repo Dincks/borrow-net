@@ -11,6 +11,7 @@ PROXY_PORT="7897"
 TEST_URL="https://api.ipify.org"
 TRIES="6"
 SLEEP_SECS="2"
+SUDO_MODE="auto"   # auto | yes | no
 
 usage() {
   cat <<EOF
@@ -22,6 +23,7 @@ usage() {
 
 示例:
   ${SCRIPT_NAME} enable 192.168.1.1 -u nbt
+  ${SCRIPT_NAME} enable 192.168.1.1 -u nbt --with-sudo
   ${SCRIPT_NAME} clear  192.168.1.1 -u nbt
   ${SCRIPT_NAME} status 192.168.1.1 -u nbt
 
@@ -32,6 +34,9 @@ usage() {
   -t, --test-url <url>      测试 URL，默认 ${TEST_URL}
   --tries <n>               重试次数，默认 ${TRIES}
   --sleep <sec>             重试间隔秒数，默认 ${SLEEP_SECS}
+  --with-sudo               如远端 sudo 需要密码，则交互式配置 apt 代理
+  --skip-sudo               跳过远端 sudo 相关操作
+  -h, --help                显示帮助
 
 说明:
   1) 这个脚本运行在你的本机
@@ -55,6 +60,21 @@ die() {
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"
+}
+
+has_tty() {
+  [ -t 0 ] && [ -t 1 ]
+}
+
+ask_yes_no() {
+  local prompt="$1"
+  local answer
+  printf "%s [y/N]: " "$prompt"
+  read -r answer || true
+  case "${answer:-}" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 ssh_target() {
@@ -96,7 +116,11 @@ PY
   '" >/dev/null
 }
 
-remote_write_config() {
+remote_sudo_nopasswd() {
+  ssh -p "$SSH_PORT" "$(ssh_target)" "sudo -n true >/dev/null 2>&1"
+}
+
+remote_write_user_config() {
   local proxy_url="http://${LOCAL_IP}:${PROXY_PORT}"
 
   ssh -p "$SSH_PORT" "$(ssh_target)" "bash -s" <<EOF
@@ -127,18 +151,6 @@ RC
   fi
 done
 
-if command -v sudo >/dev/null 2>&1; then
-  if sudo -n true >/dev/null 2>&1; then
-    sudo mkdir -p /etc/apt/apt.conf.d
-    sudo tee /etc/apt/apt.conf.d/95borrow-net >/dev/null <<APT
-Acquire::http::Proxy "${proxy_url}/";
-Acquire::https::Proxy "${proxy_url}/";
-APT
-  else
-    echo "[WARN] sudo 需要密码，已跳过 apt 代理配置"
-  fi
-fi
-
 if command -v npm >/dev/null 2>&1; then
   npm config set proxy "${proxy_url}" >/dev/null 2>&1 || true
   npm config set https-proxy "${proxy_url}" >/dev/null 2>&1 || true
@@ -151,7 +163,7 @@ fi
 EOF
 }
 
-remote_clear_config() {
+remote_clear_user_config() {
   ssh -p "$SSH_PORT" "$(ssh_target)" "bash -s" <<'EOF'
 set -euo pipefail
 
@@ -161,14 +173,6 @@ for rc in "$HOME/.bashrc" "$HOME/.profile"; do
   [ -f "$rc" ] || continue
   sed -i '/# >>> borrow-net >>>/,/# <<< borrow-net <<</d' "$rc"
 done
-
-if command -v sudo >/dev/null 2>&1; then
-  if sudo -n true >/dev/null 2>&1; then
-    sudo rm -f /etc/apt/apt.conf.d/95borrow-net
-  else
-    echo "[WARN] sudo 需要密码，已跳过 apt 代理清理"
-  fi
-fi
 
 if command -v npm >/dev/null 2>&1; then
   npm config delete proxy >/dev/null 2>&1 || true
@@ -180,6 +184,94 @@ if command -v git >/dev/null 2>&1; then
   git config --global --unset-all https.proxy >/dev/null 2>&1 || true
 fi
 EOF
+}
+
+remote_write_apt_proxy_nopasswd() {
+  local proxy_url="http://${LOCAL_IP}:${PROXY_PORT}"
+
+  ssh -p "$SSH_PORT" "$(ssh_target)" "bash -lc '
+    sudo -n mkdir -p /etc/apt/apt.conf.d
+    sudo -n tee /etc/apt/apt.conf.d/95borrow-net >/dev/null <<APT
+Acquire::http::Proxy \"${proxy_url}/\";
+Acquire::https::Proxy \"${proxy_url}/\";
+APT
+  '"
+}
+
+remote_write_apt_proxy_interactive() {
+  local proxy_url="http://${LOCAL_IP}:${PROXY_PORT}"
+
+  ssh -tt -p "$SSH_PORT" "$(ssh_target)" "sudo bash -lc 'mkdir -p /etc/apt/apt.conf.d && cat > /etc/apt/apt.conf.d/95borrow-net <<\"EOF\"
+Acquire::http::Proxy \"${proxy_url}/\";
+Acquire::https::Proxy \"${proxy_url}/\";
+EOF
+'"
+}
+
+remote_clear_apt_proxy_nopasswd() {
+  ssh -p "$SSH_PORT" "$(ssh_target)" "sudo -n rm -f /etc/apt/apt.conf.d/95borrow-net"
+}
+
+remote_clear_apt_proxy_interactive() {
+  ssh -tt -p "$SSH_PORT" "$(ssh_target)" "sudo rm -f /etc/apt/apt.conf.d/95borrow-net"
+}
+
+maybe_configure_apt_proxy() {
+  if [ "$SUDO_MODE" = "no" ]; then
+    warn "已按要求跳过远端 apt 代理配置"
+    return 0
+  fi
+
+  if remote_sudo_nopasswd; then
+    log "检测到远端 sudo 免密，自动配置 apt 代理"
+    remote_write_apt_proxy_nopasswd
+    return 0
+  fi
+
+  if [ "$SUDO_MODE" = "yes" ]; then
+    if has_tty; then
+      log "远端 sudo 需要密码，开始交互式配置 apt 代理"
+      remote_write_apt_proxy_interactive
+    else
+      warn "本地不是交互终端，无法进行远端 sudo 密码输入，已跳过 apt 代理配置"
+    fi
+    return 0
+  fi
+
+  if has_tty && ask_yes_no "远端 sudo 需要密码，是否现在交互式配置 apt 代理"; then
+    remote_write_apt_proxy_interactive
+  else
+    warn "已跳过 apt 代理配置"
+  fi
+}
+
+maybe_clear_apt_proxy() {
+  if [ "$SUDO_MODE" = "no" ]; then
+    warn "已按要求跳过远端 apt 代理清理"
+    return 0
+  fi
+
+  if remote_sudo_nopasswd; then
+    log "检测到远端 sudo 免密，自动清理 apt 代理"
+    remote_clear_apt_proxy_nopasswd
+    return 0
+  fi
+
+  if [ "$SUDO_MODE" = "yes" ]; then
+    if has_tty; then
+      log "远端 sudo 需要密码，开始交互式清理 apt 代理"
+      remote_clear_apt_proxy_interactive
+    else
+      warn "本地不是交互终端，无法进行远端 sudo 密码输入，已跳过 apt 代理清理"
+    fi
+    return 0
+  fi
+
+  if has_tty && ask_yes_no "远端 sudo 需要密码，是否现在交互式清理 apt 代理"; then
+    remote_clear_apt_proxy_interactive
+  else
+    warn "已跳过 apt 代理清理"
+  fi
 }
 
 remote_status() {
@@ -201,6 +293,24 @@ remote_status() {
       cat /etc/apt/apt.conf.d/95borrow-net
     else
       echo \"not found\"
+    fi
+
+    echo
+    echo \"===== npm proxy =====\"
+    if command -v npm >/dev/null 2>&1; then
+      npm config get proxy || true
+      npm config get https-proxy || true
+    else
+      echo \"npm not found\"
+    fi
+
+    echo
+    echo \"===== git proxy =====\"
+    if command -v git >/dev/null 2>&1; then
+      git config --global --get http.proxy || true
+      git config --global --get https.proxy || true
+    else
+      echo \"git not found\"
     fi
   '"
 }
@@ -280,6 +390,14 @@ interactive_mode() {
   if [ -n "${input_proxy_port:-}" ]; then
     PROXY_PORT="$input_proxy_port"
   fi
+
+  if [ "$MODE" != "status" ]; then
+    if ask_yes_no "是否在需要时交互式配置远端 apt 代理"; then
+      SUDO_MODE="yes"
+    else
+      SUDO_MODE="auto"
+    fi
+  fi
 }
 
 if [ $# -eq 0 ]; then
@@ -315,6 +433,14 @@ else
         SLEEP_SECS="$2"
         shift 2
         ;;
+      --with-sudo)
+        SUDO_MODE="yes"
+        shift
+        ;;
+      --skip-sudo)
+        SUDO_MODE="no"
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -334,10 +460,7 @@ need_cmd awk
 need_cmd ssh
 need_cmd ping
 need_cmd sed
-
-if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-  die "本机至少需要 curl 或 wget"
-fi
+need_cmd curl
 
 LOCAL_IP="$(find_local_ip_for_target)"
 [ -n "$LOCAL_IP" ] || die "无法自动找到通往 ${TARGET_IP} 的本机 IP"
@@ -362,8 +485,10 @@ case "$MODE" in
     log "检查远端是否能访问本机代理"
     test_remote_can_reach_local_proxy || die "远端暂时无法访问 http://${LOCAL_IP}:${PROXY_PORT}，请检查 Clash 的局域网连接和本机防火墙"
 
-    log "写入远端代理配置"
-    remote_write_config
+    log "写入远端用户级代理配置"
+    remote_write_user_config
+
+    maybe_configure_apt_proxy
 
     log "测试远端联网"
     remote_test_online || exit 1
@@ -371,11 +496,15 @@ case "$MODE" in
     echo
     echo "[OK] 已完成"
     echo "远端现在通过你的本机代理上网： http://${LOCAL_IP}:${PROXY_PORT}"
+    echo "查看状态："
+    echo "  ${SCRIPT_NAME} status ${TARGET_IP} -u ${SSH_USER} -P ${SSH_PORT}"
     echo "清除命令："
     echo "  ${SCRIPT_NAME} clear ${TARGET_IP} -u ${SSH_USER} -P ${SSH_PORT}"
     ;;
   clear)
-    remote_clear_config
+    remote_clear_user_config
+    maybe_clear_apt_proxy
+
     echo
     echo "[OK] 已清除远端代理配置"
     ;;
