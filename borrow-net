@@ -751,7 +751,7 @@ MENU
         SSH_USER="$(read_tty "SSH 用户名" "$SSH_USER")"
         SSH_PORT="$(read_tty "SSH 端口" "$SSH_PORT")"
         if ask_yes_no "是否手动指定代理端口或 URL" "N"; then
-          PROXY_URL_MANUAL="$(read_tty "代理 URL，例如 http://127.0.0.1:7897")
+          PROXY_URL_MANUAL="$(read_tty "代理 URL，例如 http://127.0.0.1:7897" "")"
         fi
         if ask_yes_no "是否配置 apt 代理，需要目标机 sudo 权限" "Y"; then
           APT_MODE="yes"
