@@ -2,7 +2,7 @@
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-https://raw.githubusercontent.com/Dincks/borrow-net/main}"
-BIN_NAME="borrow-net"
+BIN_NAME="${BIN_NAME:-borrow-net}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 TARGET="${INSTALL_DIR}/${BIN_NAME}"
 
@@ -42,7 +42,9 @@ esac
 
 echo
 echo "[OK] 安装完成"
-echo "可用命令："
-echo "  ${BIN_NAME}"
-echo "  ${BIN_NAME} enable 192.168.1.1 -u nbt"
-echo "  ${BIN_NAME} clear 192.168.1.1 -u nbt"
+echo "常用命令："
+echo "  ${BIN_NAME} detect"
+echo "  ${BIN_NAME} detect <目标IP> -u <用户名>"
+echo "  ${BIN_NAME} enable <目标IP> -u <用户名> --with-apt"
+echo "  ${BIN_NAME} status <目标IP> -u <用户名>"
+echo "  ${BIN_NAME} clear <目标IP> -u <用户名> --with-apt"
