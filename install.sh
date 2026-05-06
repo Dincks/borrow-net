@@ -5,6 +5,7 @@ BASE_URL="${BASE_URL:-https://raw.githubusercontent.com/Dincks/borrow-net/main}"
 BIN_NAME="${BIN_NAME:-borrow-net}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 TARGET="${INSTALL_DIR}/${BIN_NAME}"
+AUTO_RUN="${AUTO_RUN:-yes}"
 
 download() {
   local url="$1"
@@ -43,8 +44,23 @@ esac
 echo
 echo "[OK] 安装完成"
 echo "常用命令："
+echo "  ${BIN_NAME}"
 echo "  ${BIN_NAME} detect"
 echo "  ${BIN_NAME} detect <目标IP> -u <用户名>"
 echo "  ${BIN_NAME} enable <目标IP> -u <用户名> --with-apt"
 echo "  ${BIN_NAME} status <目标IP> -u <用户名>"
 echo "  ${BIN_NAME} clear <目标IP> -u <用户名> --with-apt"
+
+if [ "${AUTO_RUN}" = "yes" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+  echo
+  printf "是否现在启动 borrow-net 交互向导？[Y/n]: " >/dev/tty
+  read -r ans </dev/tty || ans=""
+  case "${ans:-Y}" in
+    y|Y|yes|YES)
+      exec "$TARGET" wizard </dev/tty >/dev/tty
+      ;;
+    *)
+      echo "之后可执行：${BIN_NAME}"
+      ;;
+  esac
+fi
