@@ -1,100 +1,82 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="3.0.0"
+VERSION="4.1.4-sudo-pw-once"
 SCRIPT_NAME="$(basename "$0")"
 
-MODE=""
+LOCAL_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+
+MODE="${1:-menu}"
 TARGET="${BORROW_NET_TARGET:-}"
-SSH_USER="${BORROW_NET_USER:-${USER}}"
+SSH_USER="${BORROW_NET_USER:-$LOCAL_USER}"
 SSH_PORT="${BORROW_NET_SSH_PORT:-22}"
 TEST_URL="${BORROW_NET_TEST_URL:-https://api.ipify.org}"
 EXTRA_TEST_URLS="${BORROW_NET_EXTRA_TEST_URLS:-https://github.com https://raw.githubusercontent.com}"
-TRIES="${BORROW_NET_TRIES:-3}"
-SLEEP_SECS="${BORROW_NET_SLEEP:-2}"
-
-APT_MODE="${BORROW_NET_APT_MODE:-auto}"       # auto | yes | no
-LOCAL_IP_OVERRIDE="${BORROW_NET_LOCAL_IP:-}"
+TRIES="${BORROW_NET_TRIES:-2}"
+SLEEP_SECS="${BORROW_NET_SLEEP:-1}"
 
 PROXY_URL_MANUAL="${BORROW_NET_PROXY_URL:-}"
 PROXY_PORT_MANUAL="${BORROW_NET_PROXY_PORT:-}"
-PROXY_HOST_MANUAL="${BORROW_NET_PROXY_HOST:-127.0.0.1}"
 PROXY_SCHEME_MANUAL="${BORROW_NET_PROXY_SCHEME:-http}"
-
-AUTO_DETECT="yes"
-SCAN_LISTEN="no"
+LOCAL_IP_OVERRIDE="${BORROW_NET_LOCAL_IP:-}"
+APT_MODE="${BORROW_NET_APT_MODE:-ask}"  # ask | yes | no
+SYNC_TIME_MODE="${BORROW_NET_SYNC_TIME:-auto}"  # auto | yes | no
 
 LOCAL_IP=""
 SEL_SCHEME=""
-SEL_HOST=""
-SEL_PORT=""
-SEL_SOURCE=""
 SEL_LOCAL_URL=""
 SEL_REMOTE_URL=""
+SEL_SOURCE=""
 
-C_SCHEME=()
-C_HOST=()
-C_PORT=()
-C_SOURCE=()
+CANDIDATES=()
+
+SSH_CONTROL_DIR=""
+SSH_CONTROL_PATH=""
+SSH_MASTER_STARTED="no"
+SUDO_PRIMED="no"
+SUDO_PASSWORD=""
 
 usage() {
-  cat <<USAGE
+  cat <<EOF
 borrow-net v${VERSION}
 
-用法:
-  ${SCRIPT_NAME} wizard
-  ${SCRIPT_NAME} detect [target_ip] [选项]
-  ${SCRIPT_NAME} enable <target_ip> [选项]
-  ${SCRIPT_NAME} clear  <target_ip> [选项]
-  ${SCRIPT_NAME} status <target_ip> [选项]
-  ${SCRIPT_NAME} test   <target_ip> [选项]
-
-典型用法:
+用法：
   ${SCRIPT_NAME}
-  ${SCRIPT_NAME} detect
-  ${SCRIPT_NAME} detect 192.168.1.2 -u sunrise
+  ${SCRIPT_NAME} enable <目标IP> -u <用户名> [选项]
+  ${SCRIPT_NAME} clear  <目标IP> -u <用户名> [选项]
+
+示例：
   ${SCRIPT_NAME} enable 192.168.1.2 -u sunrise --with-apt
-  ${SCRIPT_NAME} enable 192.168.1.2 -u sunrise --proxy-url http://127.0.0.1:7897 --with-apt
-  ${SCRIPT_NAME} status 192.168.1.2 -u sunrise
   ${SCRIPT_NAME} clear  192.168.1.2 -u sunrise --with-apt
 
-通用选项:
-  -u, --user <user>            远端 SSH 用户名，默认当前用户名
-  -P, --ssh-port <port>        远端 SSH 端口，默认 22
-  -t, --test-url <url>         主测试 URL，默认 ${TEST_URL}
-  --extra-test-urls "<urls>"   追加外网测试 URL，默认: ${EXTRA_TEST_URLS}
-  --tries <n>                  联网测试重试次数，默认 ${TRIES}
-  --sleep <sec>                重试间隔秒数，默认 ${SLEEP_SECS}
-
-代理选项:
-  --proxy-url <url>            手动指定本机代理，例如 http://127.0.0.1:7897
-  -p, --proxy-port <port>      手动指定本机代理端口
-  --proxy-host <host>          手动指定本机代理监听地址，默认 127.0.0.1
-  --proxy-scheme <scheme>      http / https / socks5 / socks5h，默认 http
-  -l, --local-ip <ip>          手动指定远端应访问的本机 IP
-  --no-auto-detect             关闭自动检测，必须配合 --proxy-url 或 -p
-  --scan-listen                扫描本机所有 TCP 监听端口；默认关闭，避免误扫 MySQL 等端口导致很慢
-
-apt / sudo 选项:
-  --with-apt, --with-sudo      配置 / 清理远端 apt 代理；sudo 密码最多输入一次
-  --no-apt, --skip-sudo        不配置 / 不清理远端 apt 代理
-  -h, --help                   显示帮助
-
-说明:
-  1) 本脚本运行在你的电脑上，通过 SSH 给远端 Linux 设备写入代理配置。
-  2) 本机代理软件需要开启 Allow LAN / 允许局域网连接。
-  3) 这是 HTTP/HTTPS/SOCKS 代理供网，不是 NAT 路由共享；ping 外网失败不代表代理失败。
-  4) apt 推荐 HTTP 代理；如果自动选到 SOCKS 代理，会自动跳过 apt 配置。
-USAGE
+选项：
+  -u, --user <user>          目标机 SSH 用户名
+  -P, --ssh-port <port>      目标机 SSH 端口，默认 22
+  --proxy-url <url>          手动指定本机代理，例如 http://127.0.0.1:7897
+  -p, --proxy-port <port>    手动指定本机代理端口
+  --proxy-scheme <scheme>    http / socks5h，默认 http
+  -l, --local-ip <ip>        手动指定目标机访问本机使用的 IP
+  --with-apt                 同时配置 / 清除 apt 代理
+  --no-apt                   不配置 / 不清除 apt 代理
+  --sync-time                配置代理前同步目标机时间，默认自动
+  --no-sync-time             不同步目标机时间
+  -h, --help                 显示帮助
+EOF
 }
 
 log() { printf '[INFO] %s\n' "$*"; }
+step() { printf '\n===== %s =====\n' "$*"; }
 ok() { printf '[ OK ] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
-err() { printf '[ERR ] %s\n' "$*" >&2; }
-die() { err "$*"; exit 1; }
-need() { command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"; }
-has_tty() { [ -r /dev/tty ] && [ -w /dev/tty ]; }
+die() { printf '[ERR ] %s\n' "$*" >&2; exit 1; }
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"
+}
+
+has_tty() {
+  [ -r /dev/tty ] && [ -w /dev/tty ]
+}
 
 read_tty() {
   local prompt="$1" default="${2:-}" ans
@@ -122,193 +104,198 @@ ask_yes_no() {
     ans="$default"
   fi
   ans="${ans:-$default}"
-  case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
-}
-
-norm_scheme() {
-  case "${1,,}" in
-    http|https) printf '%s\n' "${1,,}" ;;
-    socks|socks5|socks5h) printf 'socks5h\n' ;;
+  case "$ans" in
+    y|Y|yes|YES) return 0 ;;
     *) return 1 ;;
   esac
 }
 
-ssh_target() { printf '%s@%s' "$SSH_USER" "$TARGET"; }
+ssh_target() {
+  printf '%s@%s' "$SSH_USER" "$TARGET"
+}
 
-ssh_run() {
-  ssh -p "$SSH_PORT" \
+setup_ssh_control() {
+  SSH_CONTROL_DIR="$(mktemp -d)"
+  SSH_CONTROL_PATH="${SSH_CONTROL_DIR}/cm-%r@%h:%p"
+  trap cleanup EXIT INT TERM
+}
+
+cleanup() {
+  if [ "${SSH_MASTER_STARTED:-no}" = "yes" ] && [ -n "${SSH_CONTROL_PATH:-}" ]; then
+    ssh -S "$SSH_CONTROL_PATH" -O exit "$(ssh_target)" >/dev/null 2>&1 || true
+  fi
+  SUDO_PASSWORD=""
+  [ -n "${SSH_CONTROL_DIR:-}" ] && rm -rf "$SSH_CONTROL_DIR" || true
+}
+
+ssh_opts() {
+  printf '%s\n' \
+    -p "$SSH_PORT" \
     -o ConnectTimeout=8 \
     -o ServerAliveInterval=10 \
     -o ServerAliveCountMax=2 \
-    "$(ssh_target)" "$@"
+    -o ControlMaster=auto \
+    -o ControlPath="$SSH_CONTROL_PATH" \
+    -o ControlPersist=10m
 }
 
-host_network_summary() {
-  echo
-  echo "===== 当前主机网络概况 ====="
-  echo "[默认路由]"
-  ip route show default 2>/dev/null || true
-  echo
-  echo "[本机 IPv4 地址]"
-  ip -4 -o addr show scope global 2>/dev/null | awk '{print "  "$2, $4}' || true
-  echo
-  echo "[疑似 VPN / TUN / TAP 接口]"
-  if ip -o link show 2>/dev/null | grep -E 'tun|tap|utun|ppp|wg|tailscale|zerotier|clash|mihomo|utun' -i; then
-    :
+ssh_run() {
+  # shellcheck disable=SC2046
+  ssh $(ssh_opts) "$(ssh_target)" "$@"
+}
+
+start_ssh_master() {
+  setup_ssh_control
+
+  step "建立 SSH 连接"
+  log "目标机：$(ssh_target)"
+  log "端口：${SSH_PORT}"
+  log "第一次连接可能需要输入 yes 和 SSH 密码；后续步骤会复用这条连接，不再反复输入 SSH 密码。"
+
+  # 先建立主连接。-M 开启 master，-fN 后台保持连接。
+  # 如果没有免密登录，这里会要求输入一次 SSH 密码。
+  # shellcheck disable=SC2046
+  if ssh $(ssh_opts) -M -fN "$(ssh_target)"; then
+    SSH_MASTER_STARTED="yes"
+    ok "SSH 复用连接已建立"
   else
-    echo "  未发现明显 VPN/TUN 接口"
+    die "SSH 连接失败，请先确认：ssh -p ${SSH_PORT} ${SSH_USER}@${TARGET}"
   fi
-  echo
-  echo "[代理环境变量]"
-  env | grep -Ei '^(http_proxy|https_proxy|all_proxy|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY)=' || echo "  未设置代理环境变量"
-  echo
 }
 
 find_local_ip() {
   if [ -n "$LOCAL_IP_OVERRIDE" ]; then
     printf '%s\n' "$LOCAL_IP_OVERRIDE"
   else
-    ip route get "$TARGET" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+    ip route get "$TARGET" 2>/dev/null | awk '{
+      for (i=1; i<=NF; i++) {
+        if ($i == "src") {
+          print $(i+1)
+          exit
+        }
+      }
+    }'
   fi
 }
 
 is_loopback_or_any() {
   case "$1" in
-    127.*|localhost|0.0.0.0|::1|'[::1]'|'[::]'|::) return 0 ;;
+    127.*|localhost|0.0.0.0|::1|'[::1]'|::|'[::]') return 0 ;;
     *) return 1 ;;
   esac
 }
 
-mk_url() { printf '%s://%s:%s' "$1" "$2" "$3"; }
-
-remote_url_for_candidate() {
-  local scheme="$1" host="$2" port="$3"
-  if is_loopback_or_any "$host"; then
-    host="$LOCAL_IP"
-  fi
-  mk_url "$scheme" "$host" "$port"
-}
-
-parse_proxy() {
-  local raw="$1" default_scheme="${2:-http}" scheme host port
+normalize_proxy_url() {
+  local raw="$1" scheme host port
   raw="${raw%/}"
-  raw="${raw#\"}"; raw="${raw%\"}"
-  raw="${raw#\'}"; raw="${raw%\'}"
 
   if [[ "$raw" =~ ^([a-zA-Z][a-zA-Z0-9+.-]*)://([^/@]+@)?\[?([^]/:@]+)\]?:([0-9]+) ]]; then
-    scheme="${BASH_REMATCH[1]}"
+    scheme="${BASH_REMATCH[1],,}"
     host="${BASH_REMATCH[3]}"
     port="${BASH_REMATCH[4]}"
   elif [[ "$raw" =~ ^([0-9]+)$ ]]; then
-    scheme="$default_scheme"; host="127.0.0.1"; port="${BASH_REMATCH[1]}"
+    scheme="${PROXY_SCHEME_MANUAL,,}"
+    host="127.0.0.1"
+    port="${BASH_REMATCH[1]}"
   elif [[ "$raw" =~ ^([^/:]+):([0-9]+)$ ]]; then
-    scheme="$default_scheme"; host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    scheme="${PROXY_SCHEME_MANUAL,,}"
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
   else
     return 1
   fi
 
-  scheme="$(norm_scheme "$scheme")" || return 1
-  [[ "$port" =~ ^[0-9]+$ ]] || return 1
-  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+  case "$scheme" in
+    http|https) ;;
+    socks|socks5|socks5h) scheme="socks5h" ;;
+    *) return 1 ;;
+  esac
 
-  printf '%s %s %s\n' "$scheme" "$host" "$port"
+  printf '%s://%s:%s\n' "$scheme" "$host" "$port"
+}
+
+proxy_scheme() {
+  printf '%s\n' "$1" | sed -E 's#^([a-zA-Z0-9+.-]+)://.*#\1#'
+}
+
+proxy_host() {
+  printf '%s\n' "$1" | sed -E 's#^[a-zA-Z0-9+.-]+://([^:/]+):[0-9]+$#\1#'
+}
+
+proxy_port() {
+  printf '%s\n' "$1" | sed -E 's#^.*:([0-9]+)$#\1#'
+}
+
+remote_proxy_url() {
+  local url="$1" scheme host port
+  scheme="$(proxy_scheme "$url")"
+  host="$(proxy_host "$url")"
+  port="$(proxy_port "$url")"
+  if is_loopback_or_any "$host"; then
+    host="$LOCAL_IP"
+  fi
+  printf '%s://%s:%s\n' "$scheme" "$host" "$port"
 }
 
 add_candidate() {
-  local scheme host port source i
-  scheme="$(norm_scheme "$1")" || return 0
-  host="$2"; port="$3"; source="$4"
-  [[ "$port" =~ ^[0-9]+$ ]] || return 0
-  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 0
+  local url="$1" source="$2" normalized item
+  normalized="$(normalize_proxy_url "$url" 2>/dev/null || true)"
+  [ -n "$normalized" ] || return 0
 
-  for i in "${!C_PORT[@]}"; do
-    [ "${C_SCHEME[$i]}|${C_HOST[$i]}|${C_PORT[$i]}" = "$scheme|$host|$port" ] && return 0
+  for item in "${CANDIDATES[@]:-}"; do
+    [ "${item%%|*}" = "$normalized" ] && return 0
   done
 
-  C_SCHEME+=("$scheme")
-  C_HOST+=("$host")
-  C_PORT+=("$port")
-  C_SOURCE+=("$source")
+  CANDIDATES+=("${normalized}|${source}")
 }
 
 collect_candidates() {
-  C_SCHEME=(); C_HOST=(); C_PORT=(); C_SOURCE=()
-
-  local parsed scheme host port var value p line proc addr
+  CANDIDATES=()
 
   if [ -n "$PROXY_URL_MANUAL" ]; then
-    parsed="$(parse_proxy "$PROXY_URL_MANUAL" "$PROXY_SCHEME_MANUAL")" || die "无法解析 --proxy-url: $PROXY_URL_MANUAL"
-    read -r scheme host port <<<"$parsed"
-    add_candidate "$scheme" "$host" "$port" "manual:url"
-    return 0
+    add_candidate "$PROXY_URL_MANUAL" "手动指定"
+    return
   fi
 
   if [ -n "$PROXY_PORT_MANUAL" ]; then
-    parsed="$(parse_proxy "${PROXY_HOST_MANUAL}:${PROXY_PORT_MANUAL}" "$PROXY_SCHEME_MANUAL")" || die "无法解析代理端口: $PROXY_PORT_MANUAL"
-    read -r scheme host port <<<"$parsed"
-    add_candidate "$scheme" "$host" "$port" "manual:port"
-    return 0
+    add_candidate "127.0.0.1:${PROXY_PORT_MANUAL}" "手动端口"
+    return
   fi
 
-  [ "$AUTO_DETECT" = "yes" ] || die "已关闭自动检测，但没有指定 --proxy-url 或 -p"
-
-  # 1) 环境变量优先
+  local var value p
   for var in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy; do
     value="${!var:-}"
-    [ -n "$value" ] || continue
-    if parsed="$(parse_proxy "$value" http 2>/dev/null)"; then
-      read -r scheme host port <<<"$parsed"
-      add_candidate "$scheme" "$host" "$port" "env:$var"
-    fi
+    [ -n "$value" ] && add_candidate "$value" "环境变量 ${var}"
   done
 
-  # 2) 常见代理端口，避免盲扫全端口
-  for p in 7897 7890 7898 7899 10809 1087 8080 8118 20171 20172 6152 9090 9097; do
-    add_candidate http 127.0.0.1 "$p" "common:http"
+  for p in 7897 7890 7898 7899 10809 1087 8080 8118 20171 20172 6152; do
+    add_candidate "http://127.0.0.1:${p}" "常见 HTTP 端口"
   done
+
   for p in 7897 7890 7891 1080 10808 20170 20171 6153; do
-    add_candidate socks5h 127.0.0.1 "$p" "common:socks"
+    add_candidate "socks5h://127.0.0.1:${p}" "常见 SOCKS 端口"
   done
-
-  # 3) 只根据疑似代理进程添加监听端口，不再默认扫描 MySQL 等无关端口
-  if command -v ss >/dev/null 2>&1; then
-    while IFS= read -r line; do
-      proc="$(printf '%s\n' "$line" | grep -Eio 'clash|mihomo|v2ray|xray|sing-box|privoxy|dae|v2raya|qv2ray|ss-local|shadowsocks|trojan|hysteria|tuic' | head -n1 || true)"
-      [ -n "$proc" ] || continue
-      addr="$(printf '%s\n' "$line" | awk '{print $4}')"
-      port="$(printf '%s\n' "$addr" | sed -E 's/^.*:([0-9]+)$/\1/')"
-      [[ "$port" =~ ^[0-9]+$ ]] || continue
-      add_candidate http 127.0.0.1 "$port" "process:$proc"
-      add_candidate socks5h 127.0.0.1 "$port" "process:$proc"
-    done < <(ss -H -ltnp 2>/dev/null || true)
-
-    if [ "$SCAN_LISTEN" = "yes" ]; then
-      while IFS= read -r port; do
-        [[ "$port" =~ ^[0-9]+$ ]] || continue
-        [ "$port" -ge 1024 ] || continue
-        add_candidate http 127.0.0.1 "$port" "ss:listen"
-      done < <(ss -H -ltn 2>/dev/null | awk '{print $4}' | sed -E 's/^.*:([0-9]+)$/\1/' | sort -n -u | head -n 80)
-    fi
-  fi
 }
 
 test_local_proxy() {
   local url="$1"
-  curl -fsS --connect-timeout 2 --max-time 6 -x "$url" "$TEST_URL" >/dev/null
+  curl -fsS --connect-timeout 2 --max-time 8 -x "$url" "$TEST_URL" >/dev/null 2>&1
 }
 
 test_remote_proxy() {
   local url="$1"
-  ssh_run bash -s <<EOF >/dev/null
+  ssh_run bash -s <<EOF >/dev/null 2>&1
 set -euo pipefail
 if command -v curl >/dev/null 2>&1; then
-  curl -fsS --connect-timeout 3 --max-time 10 -x "$url" "$TEST_URL" >/dev/null
+  curl -fsS --connect-timeout 3 --max-time 12 -x "$url" "$TEST_URL" >/dev/null
 elif command -v python3 >/dev/null 2>&1; then
   python3 - <<PY
 import urllib.request
 proxy = "$url"
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-with opener.open("$TEST_URL", timeout=10) as r:
+opener = urllib.request.build_opener(
+    urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+)
+with opener.open("$TEST_URL", timeout=12) as r:
     r.read()
 PY
 else
@@ -317,175 +304,226 @@ fi
 EOF
 }
 
-prepare_remote() {
-  [ -n "$TARGET" ] || die "请提供目标设备 IP，例如：${SCRIPT_NAME} enable 192.168.1.2 -u username"
+prepare_target() {
+  [ -n "$TARGET" ] || die "目标机 IP 不能为空"
 
   LOCAL_IP="$(find_local_ip)"
-  [ -n "$LOCAL_IP" ] || die "无法找到通往 $TARGET 的本机 IP，请用 --local-ip 手动指定"
+  [ -n "$LOCAL_IP" ] || die "无法自动找到通往 ${TARGET} 的本机 IP，请用 -l 指定"
 
-  echo
-  echo "===== 目标机连接检查 ====="
-  log "目标设备: $TARGET"
-  log "SSH 用户: $SSH_USER"
-  log "SSH 端口: $SSH_PORT"
-  log "远端访问本机应使用 IP: $LOCAL_IP"
+  step "目标机确认"
+  log "目标机 IP：${TARGET}"
+  log "SSH 用户：${SSH_USER}"
+  log "SSH 端口：${SSH_PORT}"
+  log "目标机访问本机代理时使用：${LOCAL_IP}"
 
   if ping -c 1 -W 1 "$TARGET" >/dev/null 2>&1; then
-    ok "目标设备可 ping 通"
+    ok "目标机可以 ping 通"
   else
-    warn "目标设备 ping 不通，继续尝试 SSH"
+    warn "目标机 ping 不通，继续测试 SSH"
   fi
 
-  if ssh_run true >/dev/null; then
-    ok "SSH 可连接"
-  else
-    die "SSH 连接失败，请先确认：ssh -p $SSH_PORT $SSH_USER@$TARGET"
-  fi
+  start_ssh_master
 }
 
 select_proxy() {
   collect_candidates
-  [ "${#C_PORT[@]}" -gt 0 ] || die "没有发现代理候选，请用 --proxy-url 或 -p 指定"
+  [ "${#CANDIDATES[@]}" -gt 0 ] || die "没有发现代理候选，请用 --proxy-url 或 -p 指定"
 
-  echo
-  echo "===== 当前主机代理检测 ====="
-  log "代理候选数量: ${#C_PORT[@]}"
+  step "自动检测本机代理"
 
-  local i s h p src lurl rurl
-  for i in "${!C_PORT[@]}"; do
-    s="${C_SCHEME[$i]}"; h="${C_HOST[$i]}"; p="${C_PORT[$i]}"; src="${C_SOURCE[$i]}"
-    lurl="$(mk_url "$s" "$h" "$p")"
+  local item local_url source remote_url
+  for item in "${CANDIDATES[@]}"; do
+    local_url="${item%%|*}"
+    source="${item#*|}"
 
-    printf '[TEST] 本机 %-24s 来源=%s ... ' "$lurl" "$src"
-    if test_local_proxy "$lurl"; then
-      printf 'OK\n'
-    else
-      printf 'FAIL\n'
+    log "测试本机代理：${local_url}"
+    if ! test_local_proxy "$local_url"; then
       continue
     fi
+    ok "本机代理可用：${local_url}"
 
-    rurl="$lurl"
-    if [ -n "$TARGET" ]; then
-      rurl="$(remote_url_for_candidate "$s" "$h" "$p")"
-      printf '[TEST] 远端 %-24s ... ' "$rurl"
-      if test_remote_proxy "$rurl"; then
-        printf 'OK\n'
-      else
-        printf 'FAIL\n'
-        warn "远端无法访问 $rurl。常见原因：代理软件未开启 Allow LAN，或本机防火墙拦截。"
-        continue
-      fi
+    remote_url="$(remote_proxy_url "$local_url")"
+    log "测试目标机访问代理：${remote_url}"
+    if test_remote_proxy "$remote_url"; then
+      SEL_LOCAL_URL="$local_url"
+      SEL_REMOTE_URL="$remote_url"
+      SEL_SCHEME="$(proxy_scheme "$local_url")"
+      SEL_SOURCE="$source"
+      ok "选择代理：${SEL_REMOTE_URL}"
+      return 0
     fi
-
-    SEL_SCHEME="$s"
-    SEL_HOST="$h"
-    SEL_PORT="$p"
-    SEL_SOURCE="$src"
-    SEL_LOCAL_URL="$lurl"
-    SEL_REMOTE_URL="$rurl"
-    ok "选择代理: 本机 $SEL_LOCAL_URL；远端 $SEL_REMOTE_URL"
-    return 0
   done
 
-  die "没有找到本机可用且远端可达的代理。可尝试 --proxy-url http://127.0.0.1:7897 或检查 Allow LAN。"
-}
-
-show_detect() {
-  host_network_summary
-  [ -n "$TARGET" ] && prepare_remote
-
-  collect_candidates
-  [ "${#C_PORT[@]}" -gt 0 ] || die "没有发现代理候选"
-
-  echo
-  echo "===== 代理候选列表 ====="
-  local i s h p src lurl rurl lok rok
-  printf '%-4s %-28s %-18s %-8s %-8s\n' "No" "Proxy" "Source" "Local" "Remote"
-  printf '%s\n' "-----------------------------------------------------------------------"
-
-  for i in "${!C_PORT[@]}"; do
-    s="${C_SCHEME[$i]}"; h="${C_HOST[$i]}"; p="${C_PORT[$i]}"; src="${C_SOURCE[$i]}"
-    lurl="$(mk_url "$s" "$h" "$p")"
-    lok="no"; rok="-"
-
-    if test_local_proxy "$lurl"; then
-      lok="yes"
-      if [ -n "$TARGET" ]; then
-        rurl="$(remote_url_for_candidate "$s" "$h" "$p")"
-        if test_remote_proxy "$rurl"; then rok="yes"; else rok="no"; fi
-      fi
-    fi
-
-    printf '%-4s %-28s %-18s %-8s %-8s\n' "$((i+1))" "$lurl" "$src" "$lok" "$rok"
-  done
-
-  echo
-  if select_proxy; then
-    echo
-    echo "[OK] 推荐代理:"
-    echo "  本机: $SEL_LOCAL_URL"
-    [ -n "$TARGET" ] && echo "  远端: $SEL_REMOTE_URL"
-    [ -n "$TARGET" ] && echo "推荐启用命令:"
-    [ -n "$TARGET" ] && echo "  ${SCRIPT_NAME} enable ${TARGET} -u ${SSH_USER} --proxy-url ${SEL_LOCAL_URL} --with-apt"
-  fi
+  die "没有找到目标机可访问的代理。请确认本机代理已开启 Allow LAN / 允许局域网连接，或用 --proxy-url 手动指定。"
 }
 
 remote_sudo_nopasswd() {
   ssh_run 'sudo -n true >/dev/null 2>&1'
 }
 
+remote_sudo_prime() {
+  local reason="${1:-执行 root 操作}" pw
+
+  # 已经验证过 sudo，则后续 root 操作复用本地内存里的 sudo 密码，
+  # 通过 sudo -S 传给目标机；不会再次向用户询问。
+  if [ "${SUDO_PRIMED:-no}" = "yes" ]; then
+    return 0
+  fi
+
+  # 如果目标机允许免密 sudo，也视为已经准备好。
+  if remote_sudo_nopasswd; then
+    SUDO_PRIMED="yes"
+    SUDO_PASSWORD=""
+    return 0
+  fi
+
+  has_tty || die "${reason} 需要目标机 sudo 权限，但当前没有交互终端，无法输入 sudo 密码"
+
+  log "${reason} 需要目标机 sudo 权限；全流程只会在这里输入一次 sudo 密码"
+  printf '[sudo] password for %s@%s: ' "$SSH_USER" "$TARGET" >/dev/tty
+  stty -echo </dev/tty
+  IFS= read -r pw </dev/tty || pw=""
+  stty echo </dev/tty
+  printf '\n' >/dev/tty
+
+  # 用 sudo -S 从 stdin 接收密码。这样不依赖 sudo 的 tty ticket，
+  # 后续即使是新的 SSH/PTY，也可以复用同一个已读取的密码。
+  if printf '%s\n' "$pw" | ssh_run 'sudo -S -p "" -v >/dev/null 2>&1'; then
+    SUDO_PASSWORD="$pw"
+    SUDO_PRIMED="yes"
+  else
+    SUDO_PASSWORD=""
+    die "sudo 验证失败：请确认 ${SSH_USER} 在目标机上有 sudo 权限，并且密码正确"
+  fi
+}
+
+upload_remote_script() {
+  local local_file="$1" remote_tmp
+  remote_tmp="$(ssh_run 'mktemp /tmp/borrow-net-root.XXXXXX.sh')"
+  remote_tmp="${remote_tmp//$'\r'/}"
+  remote_tmp="${remote_tmp//$'\n'/}"
+  [ -n "$remote_tmp" ] || die "无法在目标机创建临时脚本"
+
+  ssh_run "cat > '$remote_tmp' && chmod 600 '$remote_tmp'" < "$local_file"
+  printf '%s\n' "$remote_tmp"
+}
+
+run_uploaded_remote_root_script() {
+  local remote_tmp="$1" quoted cmd
+  quoted="$(printf '%q' "$remote_tmp")"
+
+  # 如果是免密 sudo，直接 sudo -n；否则用第一次读取的密码通过 sudo -S 执行。
+  # 业务脚本来自远端临时文件，不占用 stdin，因此 sudo -S 可以稳定读取密码。
+  if [ -z "${SUDO_PASSWORD:-}" ]; then
+    cmd="sudo -n bash $quoted; rc=\$?; rm -f $quoted; exit \$rc"
+    ssh_run "$cmd"
+  else
+    cmd="sudo -S -p '' bash $quoted; rc=\$?; rm -f $quoted; exit \$rc"
+    printf '%s\n' "$SUDO_PASSWORD" | ssh_run "$cmd"
+  fi
+}
+
+run_remote_root_required() {
+  local reason="$1" tmp remote_tmp
+  tmp="$(mktemp)"
+  cat > "$tmp"
+
+  remote_sudo_prime "$reason"
+
+  remote_tmp="$(upload_remote_script "$tmp")"
+  rm -f "$tmp"
+  run_uploaded_remote_root_script "$remote_tmp"
+}
+
+sync_target_time() {
+  case "$SYNC_TIME_MODE" in
+    no)
+      warn "跳过目标机时间同步"
+      return 0
+      ;;
+    auto|yes) ;;
+    *) die "SYNC_TIME_MODE 只能是 auto / yes / no" ;;
+  esac
+
+  step "同步目标机时间"
+
+  local local_epoch remote_epoch diff absdiff
+  local_epoch="$(date -u +%s)"
+  remote_epoch="$(ssh_run date -u +%s 2>/dev/null || printf '0')"
+  remote_epoch="${remote_epoch//$'\r'/}"
+  remote_epoch="${remote_epoch//$'\n'/}"
+
+  if ! [[ "$remote_epoch" =~ ^[0-9]+$ ]]; then
+    remote_epoch=0
+  fi
+
+  diff=$((local_epoch - remote_epoch))
+  if [ "$diff" -lt 0 ]; then
+    absdiff=$((-diff))
+  else
+    absdiff="$diff"
+  fi
+
+  log "本机 UTC epoch：${local_epoch}"
+  log "目标机 UTC epoch：${remote_epoch}"
+
+  if [ "$SYNC_TIME_MODE" = "auto" ] && [ "$absdiff" -le 300 ]; then
+    ok "目标机时间偏差 ${absdiff}s，不需要同步"
+    return 0
+  fi
+
+  run_remote_root_required "同步目标机时间" <<EOF
+set -euo pipefail
+date -u -s '@${local_epoch}' >/dev/null
+if command -v timedatectl >/dev/null 2>&1; then
+  timedatectl set-ntp true >/dev/null 2>&1 || true
+fi
+EOF
+
+  ok "目标机时间已同步到本机当前时间"
+}
+
 run_remote_root() {
-  local tmp
+  local tmp remote_tmp
   tmp="$(mktemp)"
   cat > "$tmp"
 
   case "$APT_MODE" in
     no)
-      warn "已跳过 apt 相关操作"
+      warn "跳过 apt 代理"
       rm -f "$tmp"
       return 0
       ;;
-    auto|yes) ;;
-    *) rm -f "$tmp"; die "APT_MODE 只能是 auto / yes / no，当前: $APT_MODE" ;;
+    yes|ask) ;;
+    *) rm -f "$tmp"; die "APT_MODE 只能是 ask / yes / no" ;;
   esac
 
-  if [ -n "$SEL_SCHEME" ] && [[ "$SEL_SCHEME" == socks* ]]; then
-    warn "当前选择的是 SOCKS 代理，不建议用于 apt，已跳过 apt 配置"
+  if [ "${SEL_SCHEME:-http}" = "socks5h" ]; then
+    warn "SOCKS 代理不适合 apt，已跳过 apt 代理"
     rm -f "$tmp"
     return 0
   fi
 
-  if remote_sudo_nopasswd; then
-    log "检测到远端 sudo 免密，执行 apt 相关操作"
-    ssh_run 'sudo -n bash -s' < "$tmp"
-    rm -f "$tmp"
-    return 0
-  fi
-
-  if [ "$APT_MODE" = "auto" ]; then
-    if ! ask_yes_no "远端 sudo 需要密码，是否现在配置 / 清理 apt 代理" "N"; then
-      warn "已跳过 apt 相关操作"
+  if [ "$APT_MODE" = "ask" ]; then
+    if ! ask_yes_no "是否配置 / 清除 apt 代理？这需要输入目标机 sudo 密码" "Y"; then
+      warn "跳过 apt 代理"
       rm -f "$tmp"
       return 0
     fi
   fi
 
-  has_tty || {
-    warn "当前不是交互终端，无法输入远端 sudo 密码，已跳过 apt 相关操作"
-    rm -f "$tmp"
-    return 0
-  }
+  remote_sudo_prime "apt 代理配置"
 
-  log "接下来最多输入一次远端用户 ${SSH_USER} 的 sudo 密码"
-  ssh -tt -p "$SSH_PORT" -o ConnectTimeout=8 "$(ssh_target)" 'sudo bash -s' < "$tmp"
+  remote_tmp="$(upload_remote_script "$tmp")"
   rm -f "$tmp"
+  run_uploaded_remote_root_script "$remote_tmp"
 }
 
 write_user_proxy() {
   local url="$SEL_REMOTE_URL" scheme="$SEL_SCHEME"
-
   ssh_run bash -s <<EOF
 set -euo pipefail
+
 mkdir -p "\$HOME/.config"
 
 cat > "\$HOME/.config/borrow-net.env" <<ENV
@@ -496,7 +534,7 @@ export NO_PROXY=localhost,127.0.0.1,::1,${TARGET},${LOCAL_IP},192.168.0.0/16,10.
 export no_proxy=localhost,127.0.0.1,::1,${TARGET},${LOCAL_IP},192.168.0.0/16,10.0.0.0/8,172.16.0.0/12
 ENV
 
-if [[ "${scheme}" != socks* ]]; then
+if [ "${scheme}" != "socks5h" ]; then
 cat >> "\$HOME/.config/borrow-net.env" <<ENV
 export HTTP_PROXY=${url}
 export HTTPS_PROXY=${url}
@@ -524,10 +562,22 @@ if command -v git >/dev/null 2>&1; then
   git config --global https.proxy "${url}" >/dev/null 2>&1 || true
 fi
 
-if [[ "${scheme}" != socks* ]] && command -v npm >/dev/null 2>&1; then
+if [ "${scheme}" != "socks5h" ] && command -v npm >/dev/null 2>&1; then
   npm config set proxy "${url}" >/dev/null 2>&1 || true
   npm config set https-proxy "${url}" >/dev/null 2>&1 || true
 fi
+EOF
+}
+
+write_apt_proxy() {
+  run_remote_root <<EOF
+set -euo pipefail
+mkdir -p /etc/apt/apt.conf.d
+cat > /etc/apt/apt.conf.d/95borrow-net <<APT
+Acquire::http::Proxy "${SEL_REMOTE_URL}/";
+Acquire::https::Proxy "${SEL_REMOTE_URL}/";
+APT
+chmod 644 /etc/apt/apt.conf.d/95borrow-net
 EOF
 }
 
@@ -554,20 +604,7 @@ fi
 EOF
 }
 
-write_apt_proxy() {
-  run_remote_root <<EOF
-set -euo pipefail
-mkdir -p /etc/apt/apt.conf.d
-cat > /etc/apt/apt.conf.d/95borrow-net <<APT
-Acquire::http::Proxy "${SEL_REMOTE_URL}/";
-Acquire::https::Proxy "${SEL_REMOTE_URL}/";
-APT
-chmod 644 /etc/apt/apt.conf.d/95borrow-net
-EOF
-}
-
 clear_apt_proxy() {
-  # clear 时没有选择代理，但 run_remote_root 需要避开 socks 判断
   SEL_SCHEME="http"
   run_remote_root <<'EOF'
 set -euo pipefail
@@ -575,61 +612,15 @@ rm -f /etc/apt/apt.conf.d/95borrow-net
 EOF
 }
 
-status_remote() {
-  ssh_run bash -s <<'EOF'
-set -euo pipefail
-
-echo "===== env file ====="
-if [ -f "$HOME/.config/borrow-net.env" ]; then
-  cat "$HOME/.config/borrow-net.env"
-else
-  echo "not found"
-fi
-
-echo
-echo "===== shell vars after source ====="
-set -a
-[ -f "$HOME/.config/borrow-net.env" ] && . "$HOME/.config/borrow-net.env"
-set +a
-env | grep -E '^(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|http_proxy|https_proxy|all_proxy|NO_PROXY|no_proxy)=' || true
-
-echo
-echo "===== apt proxy ====="
-if [ -f /etc/apt/apt.conf.d/95borrow-net ]; then
-  cat /etc/apt/apt.conf.d/95borrow-net
-else
-  echo "not found"
-fi
-
-echo
-echo "===== git proxy ====="
-if command -v git >/dev/null 2>&1; then
-  git config --global --get http.proxy || true
-  git config --global --get https.proxy || true
-else
-  echo "git not found"
-fi
-
-echo
-echo "===== npm proxy ====="
-if command -v npm >/dev/null 2>&1; then
-  npm config get proxy || true
-  npm config get https-proxy || true
-else
-  echo "npm not found"
-fi
-EOF
-}
-
 remote_online_tests() {
-  local test_urls all_urls i u ok_count
-  all_urls="$TEST_URL $EXTRA_TEST_URLS"
+  step "目标机外网测试"
+
+  local urls url i ok_count
+  urls="${TEST_URL} ${EXTRA_TEST_URLS}"
   ok_count=0
 
-  echo
-  echo "===== 目标机外网连接测试 ====="
-
-  for u in $all_urls; do
+  for url in $urls; do
+    log "测试：${url}"
     for i in $(seq 1 "$TRIES"); do
       if ssh_run bash -s <<EOF >/tmp/borrow_net_test.out 2>/tmp/borrow_net_test.err
 set -euo pipefail
@@ -638,221 +629,197 @@ set -a
 set +a
 
 if command -v curl >/dev/null 2>&1; then
-  curl -fsS --connect-timeout 3 --max-time 12 "$u" | head -c 200
+  curl -fsS --connect-timeout 3 --max-time 12 "$url" | head -c 120
 elif command -v python3 >/dev/null 2>&1; then
   python3 - <<PY
 import os, urllib.request
 proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}) if proxy else urllib.request.ProxyHandler({}))
-with opener.open("$u", timeout=12) as r:
-    print(r.read(200).decode("utf-8", "ignore"))
+handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy}) if proxy else urllib.request.ProxyHandler({})
+opener = urllib.request.build_opener(handler)
+with opener.open("$url", timeout=12) as r:
+    print(r.read(120).decode("utf-8", "ignore"))
 PY
 else
   exit 1
 fi
 EOF
       then
-        ok "远端可访问: $u"
-        if [ "$u" = "$TEST_URL" ]; then
-          log "主测试返回: $(tr -d '\n' </tmp/borrow_net_test.out)"
-        fi
+        ok "可访问：${url}"
         ok_count=$((ok_count + 1))
         break
       fi
 
-      [ "$i" -lt "$TRIES" ] && warn "访问 $u 第 ${i}/${TRIES} 次失败，${SLEEP_SECS}s 后重试" && sleep "$SLEEP_SECS"
+      if [ "$i" -lt "$TRIES" ]; then
+        sleep "$SLEEP_SECS"
+      fi
     done
   done
 
   rm -f /tmp/borrow_net_test.out /tmp/borrow_net_test.err
 
-  [ "$ok_count" -gt 0 ] || {
-    warn "目标机外网测试全部失败"
-    return 1
-  }
-
-  ok "目标机具备通过代理访问外网的能力"
+  [ "$ok_count" -gt 0 ] || die "目标机外网测试失败"
+  ok "目标机已经具备外网访问能力"
 }
 
 enable_flow() {
-  host_network_summary
-  prepare_remote
+  prepare_target
+  sync_target_time
   select_proxy
 
-  echo
-  echo "===== 写入目标机代理配置 ====="
-  log "写入用户级代理环境变量、git、npm 配置"
+  step "写入目标机代理配置"
   write_user_proxy
-  ok "用户级代理配置完成"
+  ok "用户级代理已写入"
 
-  log "配置 apt 代理"
   write_apt_proxy
 
   remote_online_tests
+
   echo
-  ok "代理供网配置完成"
-  echo "查看状态：${SCRIPT_NAME} status ${TARGET} -u ${SSH_USER}"
-  echo "清除配置：${SCRIPT_NAME} clear ${TARGET} -u ${SSH_USER} --with-apt"
+  ok "代理配置完成"
 }
 
 clear_flow() {
-  prepare_remote
-  echo
-  echo "===== 清理目标机代理配置 ====="
+  prepare_target
+
+  step "清除目标机代理配置"
   clear_user_proxy
-  ok "用户级代理配置已清理"
+  ok "用户级代理已清除"
+
   clear_apt_proxy
-  ok "清理完成"
+
+  echo
+  ok "清除完成"
 }
 
-status_flow() {
-  prepare_remote
-  status_remote
+menu_enable() {
+  TARGET="$(read_tty "目标机 IP")"
+  SSH_USER="$(read_tty "SSH 用户名" "$SSH_USER")"
+  SSH_PORT="$(read_tty "SSH 端口" "$SSH_PORT")"
+
+  if ask_yes_no "是否手动指定代理 URL，例如 http://127.0.0.1:7897" "N"; then
+    PROXY_URL_MANUAL="$(read_tty "代理 URL" "http://127.0.0.1:7897")"
+  fi
+
+  if ask_yes_no "是否同时配置 apt 代理" "Y"; then
+    APT_MODE="yes"
+  else
+    APT_MODE="no"
+  fi
+
+  enable_flow
 }
 
-test_flow() {
-  prepare_remote
-  if [ -f /tmp/nonexistent ]; then :; fi
-  remote_online_tests
+menu_clear() {
+  TARGET="$(read_tty "目标机 IP")"
+  SSH_USER="$(read_tty "SSH 用户名" "$SSH_USER")"
+  SSH_PORT="$(read_tty "SSH 端口" "$SSH_PORT")"
+
+  if ask_yes_no "是否同时清除 apt 代理" "Y"; then
+    APT_MODE="yes"
+  else
+    APT_MODE="no"
+  fi
+
+  clear_flow
 }
 
-wizard() {
-  has_tty || die "当前没有交互终端，无法启动向导。请直接使用命令行参数。"
+menu() {
+  has_tty || die "当前没有交互终端，请用命令行模式运行"
 
-  while true; do
-    cat >/dev/tty <<MENU
+  cat >/dev/tty <<MENU
 
 borrow-net v${VERSION}
-请选择功能:
-  1) 分析当前主机代理 / 网络情况
-  2) 给目标机配置代理供网
-  3) 测试目标机是否可访问外网
-  4) 查看目标机代理状态
-  5) 清除目标机代理配置
+请选择功能：
+  1) 代理
+  2) 消除
   0) 退出
 
 MENU
-    local choice
-    choice="$(read_tty "请输入序号" "1")"
 
-    case "$choice" in
-      1)
-        TARGET=""
-        if ask_yes_no "是否同时检测某台目标机能否访问本机代理" "N"; then
-          TARGET="$(read_tty "目标机 IP")"
-          SSH_USER="$(read_tty "SSH 用户名" "$SSH_USER")"
-          SSH_PORT="$(read_tty "SSH 端口" "$SSH_PORT")"
-          prepare_remote
-        fi
-        show_detect
-        ;;
-      2)
-        TARGET="$(read_tty "目标机 IP")"
-        SSH_USER="$(read_tty "SSH 用户名" "$SSH_USER")"
-        SSH_PORT="$(read_tty "SSH 端口" "$SSH_PORT")"
-        if ask_yes_no "是否手动指定代理端口或 URL" "N"; then
-          PROXY_URL_MANUAL="$(read_tty "代理 URL，例如 http://127.0.0.1:7897" "")"
-        fi
-        if ask_yes_no "是否配置 apt 代理，需要目标机 sudo 权限" "Y"; then
-          APT_MODE="yes"
-        else
-          APT_MODE="no"
-        fi
-        enable_flow
-        ;;
-      3)
-        TARGET="$(read_tty "目标机 IP")"
-        SSH_USER="$(read_tty "SSH 用户名" "$SSH_USER")"
-        SSH_PORT="$(read_tty "SSH 端口" "$SSH_PORT")"
-        prepare_remote
-        remote_online_tests || true
-        ;;
-      4)
-        TARGET="$(read_tty "目标机 IP")"
-        SSH_USER="$(read_tty "SSH 用户名" "$SSH_USER")"
-        SSH_PORT="$(read_tty "SSH 端口" "$SSH_PORT")"
-        status_flow
-        ;;
-      5)
-        TARGET="$(read_tty "目标机 IP")"
-        SSH_USER="$(read_tty "SSH 用户名" "$SSH_USER")"
-        SSH_PORT="$(read_tty "SSH 端口" "$SSH_PORT")"
-        if ask_yes_no "是否清理 apt 代理，需要目标机 sudo 权限" "Y"; then
-          APT_MODE="yes"
-        else
-          APT_MODE="no"
-        fi
-        clear_flow
-        ;;
-      0)
-        exit 0
-        ;;
-      *)
-        warn "无效选择"
-        ;;
-    esac
-  done
+  local choice
+  choice="$(read_tty "请输入序号" "1")"
+
+  case "$choice" in
+    1)
+      menu_enable
+      exit 0
+      ;;
+    2)
+      menu_clear
+      exit 0
+      ;;
+    0|3|q|Q|exit)
+      exit 0
+      ;;
+    *)
+      die "无效选择"
+      ;;
+  esac
 }
 
 parse_args() {
-  if [ $# -eq 0 ]; then
-    MODE="wizard"
-    return
-  fi
-
-  MODE="$1"
-  shift || true
-
-  case "$MODE" in
-    wizard|detect|enable|clear|status|test) ;;
-    -h|--help|help) usage; exit 0 ;;
-    *) usage; exit 1 ;;
+  case "${1:-menu}" in
+    menu|wizard)
+      MODE="menu"
+      shift || true
+      ;;
+    enable)
+      MODE="enable"
+      shift
+      TARGET="${1:-}"
+      [ $# -gt 0 ] && shift
+      ;;
+    clear)
+      MODE="clear"
+      shift
+      TARGET="${1:-}"
+      [ $# -gt 0 ] && shift
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
   esac
-
-  if [ $# -gt 0 ] && [[ "${1:-}" != -* ]]; then
-    TARGET="$1"
-    shift
-  fi
 
   while [ $# -gt 0 ]; do
     case "$1" in
       -u|--user) SSH_USER="$2"; shift 2 ;;
       -P|--ssh-port) SSH_PORT="$2"; shift 2 ;;
-      -t|--test-url) TEST_URL="$2"; shift 2 ;;
-      --extra-test-urls) EXTRA_TEST_URLS="$2"; shift 2 ;;
-      --tries) TRIES="$2"; shift 2 ;;
-      --sleep) SLEEP_SECS="$2"; shift 2 ;;
       --proxy-url) PROXY_URL_MANUAL="$2"; shift 2 ;;
       -p|--proxy-port) PROXY_PORT_MANUAL="$2"; shift 2 ;;
-      --proxy-host) PROXY_HOST_MANUAL="$2"; shift 2 ;;
       --proxy-scheme) PROXY_SCHEME_MANUAL="$2"; shift 2 ;;
       -l|--local-ip) LOCAL_IP_OVERRIDE="$2"; shift 2 ;;
-      --no-auto-detect) AUTO_DETECT="no"; shift ;;
-      --scan-listen) SCAN_LISTEN="yes"; shift ;;
       --with-apt|--with-sudo) APT_MODE="yes"; shift ;;
       --no-apt|--skip-sudo) APT_MODE="no"; shift ;;
+      --sync-time) SYNC_TIME_MODE="yes"; shift ;;
+      --no-sync-time) SYNC_TIME_MODE="no"; shift ;;
       -h|--help) usage; exit 0 ;;
-      *) die "未知参数: $1" ;;
+      *) die "未知参数：$1" ;;
     esac
   done
 }
 
 main() {
-  parse_args "$@"
-
   need ip
   need awk
   need ssh
   need sed
   need curl
 
+  parse_args "$@"
+
+  if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    warn "本脚本通常不需要用 sudo 运行；继续执行，但默认 SSH 用户已按 ${SUDO_USER} 处理"
+  fi
+
   case "$MODE" in
-    wizard) wizard ;;
-    detect) show_detect ;;
+    menu) menu ;;
     enable) enable_flow ;;
     clear) clear_flow ;;
-    status) status_flow ;;
-    test) test_flow ;;
   esac
 }
 
