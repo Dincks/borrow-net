@@ -2,6 +2,7 @@
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-https://raw.githubusercontent.com/Dincks/borrow-net/main}"
+INSTALL_URL="${INSTALL_URL:-${BASE_URL}/install.sh}"
 BIN_NAME="${BIN_NAME:-borrow-net}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 TARGET="${INSTALL_DIR}/${BIN_NAME}"
@@ -50,6 +51,9 @@ echo "  ${BIN_NAME} detect <目标IP> -u <用户名>"
 echo "  ${BIN_NAME} enable <目标IP> -u <用户名> --with-apt"
 echo "  ${BIN_NAME} status <目标IP> -u <用户名>"
 echo "  ${BIN_NAME} clear <目标IP> -u <用户名> --with-apt"
+echo
+echo "一键安装（wget）："
+echo "  wget -qO- ${INSTALL_URL} | bash"
 
 if [ "${AUTO_RUN}" = "yes" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
   echo
