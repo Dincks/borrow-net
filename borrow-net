@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="4.1.4-sudo-pw-once"
+VERSION="4.5.0"
 SCRIPT_NAME="$(basename "$0")"
-
-LOCAL_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 
 MODE="${1:-menu}"
 TARGET="${BORROW_NET_TARGET:-}"
-SSH_USER="${BORROW_NET_USER:-$LOCAL_USER}"
+SSH_USER="${BORROW_NET_USER:-}"
 SSH_PORT="${BORROW_NET_SSH_PORT:-22}"
 TEST_URL="${BORROW_NET_TEST_URL:-https://api.ipify.org}"
 EXTRA_TEST_URLS="${BORROW_NET_EXTRA_TEST_URLS:-https://github.com https://raw.githubusercontent.com}"
@@ -20,7 +18,8 @@ PROXY_PORT_MANUAL="${BORROW_NET_PROXY_PORT:-}"
 PROXY_SCHEME_MANUAL="${BORROW_NET_PROXY_SCHEME:-http}"
 LOCAL_IP_OVERRIDE="${BORROW_NET_LOCAL_IP:-}"
 APT_MODE="${BORROW_NET_APT_MODE:-ask}"  # ask | yes | no
-SYNC_TIME_MODE="${BORROW_NET_SYNC_TIME:-auto}"  # auto | yes | no
+APT_HANDLED="no"
+SYNC_TIME_MODE="${BORROW_NET_SYNC_TIME:-no}"  # auto | yes | no
 
 LOCAL_IP=""
 SEL_SCHEME=""
@@ -35,6 +34,10 @@ SSH_CONTROL_PATH=""
 SSH_MASTER_STARTED="no"
 SUDO_PRIMED="no"
 SUDO_PASSWORD=""
+AUTH_PASSWORD=""
+AUTH_PASSWORD_CAPTURED="no"
+ASKPASS_DIR=""
+ENABLE_ROLLBACK_ARMED="no"
 
 usage() {
   cat <<EOF
@@ -50,17 +53,23 @@ borrow-net v${VERSION}
   ${SCRIPT_NAME} clear  192.168.1.2 -u sunrise --with-apt
 
 选项：
-  -u, --user <user>          目标机 SSH 用户名
-  -P, --ssh-port <port>      目标机 SSH 端口，默认 22
-  --proxy-url <url>          手动指定本机代理，例如 http://127.0.0.1:7897
-  -p, --proxy-port <port>    手动指定本机代理端口
+  -u, --user <user>          目标主机 SSH 用户名
+  -P, --ssh-port <port>      目标主机 SSH 端口，默认 22
+  --proxy-url <url>          覆盖自动检测结果，手动指定本机代理
+  -p, --proxy-port <port>    覆盖自动检测结果，手动指定本机代理端口
   --proxy-scheme <scheme>    http / socks5h，默认 http
-  -l, --local-ip <ip>        手动指定目标机访问本机使用的 IP
-  --with-apt                 同时配置 / 清除 apt 代理
-  --no-apt                   不配置 / 不清除 apt 代理
-  --sync-time                配置代理前同步目标机时间，默认自动
-  --no-sync-time             不同步目标机时间
+  -l, --local-ip <ip>        手动指定目标主机访问本机所使用的 IP
+  --with-apt                 同时配置 / 清除 APT 系统级代理
+  --no-apt                   不配置 / 不清除 APT 系统级代理
+  --sync-time                配置代理前同步目标主机时间
+  --no-sync-time             不同步目标主机时间（默认）
   -h, --help                 显示帮助
+
+说明：
+  - 若 SSH 已配置公钥/Agent 免密认证，仅需输入一次 sudo 密码。
+  - 若 SSH 需要密码，脚本仅询问一次，并将同一密码用于后续 sudo 认证；因此 SSH 与 sudo 密码需保持一致。
+  - 执行 enable 后会部署一次性的 systemd 生命周期清理：正常关机/重启时恢复原配置并移除 borrow-net 组件。
+  - 若发生异常断电，残留状态会在下一次启动时恢复，随后同样移除 borrow-net 组件。
 EOF
 }
 
@@ -68,10 +77,10 @@ log() { printf '[INFO] %s\n' "$*"; }
 step() { printf '\n===== %s =====\n' "$*"; }
 ok() { printf '[ OK ] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
-die() { printf '[ERR ] %s\n' "$*" >&2; exit 1; }
+die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
 need() {
-  command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"
+  command -v "$1" >/dev/null 2>&1 || die "缺少必要的系统命令：$1"
 }
 
 has_tty() {
@@ -90,6 +99,31 @@ read_tty() {
     printf '%s\n' "${ans:-$default}"
   else
     printf '%s\n' "$default"
+  fi
+}
+
+read_required_tty() {
+  local prompt="$1" ans
+  has_tty || die "当前会话无可用交互终端，请使用命令行参数指定 ${prompt}。"
+  while true; do
+    printf '%s: ' "$prompt" >/dev/tty
+    IFS= read -r ans </dev/tty || ans=""
+    if [ -n "$ans" ]; then
+      printf '%s\n' "$ans"
+      return 0
+    fi
+    printf '[ERROR] %s不能为空。\n' "$prompt" >/dev/tty
+  done
+}
+
+read_optional_tty() {
+  local prompt="$1" hint="$2" ans
+  if has_tty; then
+    printf '%s [%s]: ' "$prompt" "$hint" >/dev/tty
+    IFS= read -r ans </dev/tty || ans=""
+    printf '%s\n' "$ans"
+  else
+    printf '\n'
   fi
 }
 
@@ -121,11 +155,26 @@ setup_ssh_control() {
 }
 
 cleanup() {
-  if [ "${SSH_MASTER_STARTED:-no}" = "yes" ] && [ -n "${SSH_CONTROL_PATH:-}" ]; then
-    ssh -S "$SSH_CONTROL_PATH" -O exit "$(ssh_target)" >/dev/null 2>&1 || true
+  if [ "${ENABLE_ROLLBACK_ARMED:-no}" = "yes" ] &&
+     [ "${SSH_MASTER_STARTED:-no}" = "yes" ]; then
+    rollback_enable >/dev/null 2>&1 || true
+    ENABLE_ROLLBACK_ARMED="no"
   fi
+
+  if [ "${SSH_MASTER_STARTED:-no}" = "yes" ] &&
+     [ -n "${SSH_CONTROL_PATH:-}" ]; then
+    ssh -S "$SSH_CONTROL_PATH" -O exit "$(ssh_target)" \
+      >/dev/null 2>&1 || true
+  fi
+
   SUDO_PASSWORD=""
-  [ -n "${SSH_CONTROL_DIR:-}" ] && rm -rf "$SSH_CONTROL_DIR" || true
+  AUTH_PASSWORD=""
+
+  [ -n "${ASKPASS_DIR:-}" ] &&
+    rm -rf "$ASKPASS_DIR" || true
+
+  [ -n "${SSH_CONTROL_DIR:-}" ] &&
+    rm -rf "$SSH_CONTROL_DIR" || true
 }
 
 ssh_opts() {
@@ -134,6 +183,7 @@ ssh_opts() {
     -o ConnectTimeout=8 \
     -o ServerAliveInterval=10 \
     -o ServerAliveCountMax=2 \
+    -o StrictHostKeyChecking=accept-new \
     -o ControlMaster=auto \
     -o ControlPath="$SSH_CONTROL_PATH" \
     -o ControlPersist=10m
@@ -144,22 +194,100 @@ ssh_run() {
   ssh $(ssh_opts) "$(ssh_target)" "$@"
 }
 
+read_auth_password_once() {
+  local pw
+
+  [ "${AUTH_PASSWORD_CAPTURED:-no}" = "yes" ] &&
+    return 0
+
+  has_tty ||
+    die "SSH 认证需要密码，但当前会话无可用交互终端，无法获取认证信息。"
+
+  printf '[AUTH] 请输入密码：' >/dev/tty
+
+  stty -echo </dev/tty
+  IFS= read -r pw </dev/tty || pw=""
+  stty echo </dev/tty
+
+  printf '\n' >/dev/tty
+
+  [ -n "$pw" ] ||
+    die "未输入密码，操作已终止"
+
+  AUTH_PASSWORD="$pw"
+  AUTH_PASSWORD_CAPTURED="yes"
+}
+
+start_ssh_master_with_password() {
+  local rc=1 pwfd askpass
+
+  read_auth_password_once
+
+  if command -v sshpass >/dev/null 2>&1; then
+    exec {pwfd}<<<"$AUTH_PASSWORD"
+
+    # shellcheck disable=SC2046
+    sshpass -d "$pwfd" ssh $(ssh_opts) \
+      -o PreferredAuthentications=publickey,password,keyboard-interactive \
+      -M -fN "$(ssh_target)" \
+      >/dev/null 2>&1 &&
+      rc=0 || rc=$?
+
+    exec {pwfd}<&-
+
+    return "$rc"
+  fi
+
+  ASKPASS_DIR="$(mktemp -d)"
+  chmod 700 "$ASKPASS_DIR"
+
+  askpass="${ASKPASS_DIR}/askpass.sh"
+
+  cat >"$askpass" <<'EOF'
+#!/bin/sh
+printf '%s\n' "${BORROW_NET_ASKPASS_PASSWORD:-}"
+EOF
+
+  chmod 700 "$askpass"
+
+  # shellcheck disable=SC2046
+  DISPLAY=borrow-net \
+  BORROW_NET_ASKPASS_PASSWORD="$AUTH_PASSWORD" \
+  SSH_ASKPASS="$askpass" \
+  SSH_ASKPASS_REQUIRE=force \
+  ssh $(ssh_opts) \
+    -o PreferredAuthentications=publickey,password,keyboard-interactive \
+    -M -fN "$(ssh_target)" \
+    </dev/null >/dev/null 2>&1 &&
+    rc=0 || rc=$?
+
+  rm -f "$askpass"
+  rmdir "$ASKPASS_DIR" 2>/dev/null || true
+  ASKPASS_DIR=""
+
+  return "$rc"
+}
+
 start_ssh_master() {
   setup_ssh_control
 
-  step "建立 SSH 连接"
-  log "目标机：$(ssh_target)"
-  log "端口：${SSH_PORT}"
-  log "第一次连接可能需要输入 yes 和 SSH 密码；后续步骤会复用这条连接，不再反复输入 SSH 密码。"
-
-  # 先建立主连接。-M 开启 master，-fN 后台保持连接。
-  # 如果没有免密登录，这里会要求输入一次 SSH 密码。
   # shellcheck disable=SC2046
-  if ssh $(ssh_opts) -M -fN "$(ssh_target)"; then
+  if ssh $(ssh_opts) \
+    -o BatchMode=yes \
+    -M -fN "$(ssh_target)" \
+    >/dev/null 2>&1; then
+
     SSH_MASTER_STARTED="yes"
-    ok "SSH 复用连接已建立"
+    ok "SSH 连接成功"
+    return 0
+  fi
+
+  if start_ssh_master_with_password; then
+    SSH_MASTER_STARTED="yes"
+    ok "SSH 连接成功"
   else
-    die "SSH 连接失败，请先确认：ssh -p ${SSH_PORT} ${SSH_USER}@${TARGET}"
+    AUTH_PASSWORD=""
+    die "SSH 连接失败，请检查主机地址、端口、用户名、密码及 SSH 服务状态"
   fi
 }
 
@@ -167,83 +295,106 @@ find_local_ip() {
   if [ -n "$LOCAL_IP_OVERRIDE" ]; then
     printf '%s\n' "$LOCAL_IP_OVERRIDE"
   else
-    ip route get "$TARGET" 2>/dev/null | awk '{
-      for (i=1; i<=NF; i++) {
-        if ($i == "src") {
-          print $(i+1)
-          exit
+    ip route get "$TARGET" 2>/dev/null |
+      awk '{
+        for (i=1; i<=NF; i++) {
+          if ($i == "src") {
+            print $(i+1)
+            exit
+          }
         }
-      }
-    }'
+      }'
   fi
 }
 
 is_loopback_or_any() {
   case "$1" in
-    127.*|localhost|0.0.0.0|::1|'[::1]'|::|'[::]') return 0 ;;
-    *) return 1 ;;
+    127.*|localhost|0.0.0.0|::1|'[::1]'|::|'[::]')
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
   esac
 }
 
 normalize_proxy_url() {
   local raw="$1" scheme host port
+
   raw="${raw%/}"
 
   if [[ "$raw" =~ ^([a-zA-Z][a-zA-Z0-9+.-]*)://([^/@]+@)?\[?([^]/:@]+)\]?:([0-9]+) ]]; then
     scheme="${BASH_REMATCH[1],,}"
     host="${BASH_REMATCH[3]}"
     port="${BASH_REMATCH[4]}"
+
   elif [[ "$raw" =~ ^([0-9]+)$ ]]; then
     scheme="${PROXY_SCHEME_MANUAL,,}"
     host="127.0.0.1"
     port="${BASH_REMATCH[1]}"
+
   elif [[ "$raw" =~ ^([^/:]+):([0-9]+)$ ]]; then
     scheme="${PROXY_SCHEME_MANUAL,,}"
     host="${BASH_REMATCH[1]}"
     port="${BASH_REMATCH[2]}"
+
   else
     return 1
   fi
 
   case "$scheme" in
-    http|https) ;;
-    socks|socks5|socks5h) scheme="socks5h" ;;
-    *) return 1 ;;
+    http|https)
+      ;;
+    socks|socks5|socks5h)
+      scheme="socks5h"
+      ;;
+    *)
+      return 1
+      ;;
   esac
 
   printf '%s://%s:%s\n' "$scheme" "$host" "$port"
 }
 
 proxy_scheme() {
-  printf '%s\n' "$1" | sed -E 's#^([a-zA-Z0-9+.-]+)://.*#\1#'
+  printf '%s\n' "$1" |
+    sed -E 's#^([a-zA-Z0-9+.-]+)://.*#\1#'
 }
 
 proxy_host() {
-  printf '%s\n' "$1" | sed -E 's#^[a-zA-Z0-9+.-]+://([^:/]+):[0-9]+$#\1#'
+  printf '%s\n' "$1" |
+    sed -E 's#^[a-zA-Z0-9+.-]+://([^:/]+):[0-9]+$#\1#'
 }
 
 proxy_port() {
-  printf '%s\n' "$1" | sed -E 's#^.*:([0-9]+)$#\1#'
+  printf '%s\n' "$1" |
+    sed -E 's#^.*:([0-9]+)$#\1#'
 }
 
 remote_proxy_url() {
   local url="$1" scheme host port
+
   scheme="$(proxy_scheme "$url")"
   host="$(proxy_host "$url")"
   port="$(proxy_port "$url")"
+
   if is_loopback_or_any "$host"; then
     host="$LOCAL_IP"
   fi
+
   printf '%s://%s:%s\n' "$scheme" "$host" "$port"
 }
 
 add_candidate() {
   local url="$1" source="$2" normalized item
+
   normalized="$(normalize_proxy_url "$url" 2>/dev/null || true)"
+
   [ -n "$normalized" ] || return 0
 
   for item in "${CANDIDATES[@]:-}"; do
-    [ "${item%%|*}" = "$normalized" ] && return 0
+    [ "${item%%|*}" = "$normalized" ] &&
+      return 0
   done
 
   CANDIDATES+=("${normalized}|${source}")
@@ -258,46 +409,107 @@ collect_candidates() {
   fi
 
   if [ -n "$PROXY_PORT_MANUAL" ]; then
-    add_candidate "127.0.0.1:${PROXY_PORT_MANUAL}" "手动端口"
+    add_candidate \
+      "127.0.0.1:${PROXY_PORT_MANUAL}" \
+      "手动端口"
     return
   fi
 
   local var value p
-  for var in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy; do
+
+  for var in \
+    HTTP_PROXY \
+    HTTPS_PROXY \
+    http_proxy \
+    https_proxy \
+    ALL_PROXY \
+    all_proxy
+  do
     value="${!var:-}"
-    [ -n "$value" ] && add_candidate "$value" "环境变量 ${var}"
+    [ -n "$value" ] &&
+      add_candidate "$value" "环境变量 ${var}"
   done
 
-  for p in 7897 7890 7898 7899 10809 1087 8080 8118 20171 20172 6152; do
-    add_candidate "http://127.0.0.1:${p}" "常见 HTTP 端口"
+  for p in \
+    7897 \
+    7890 \
+    7898 \
+    7899 \
+    10809 \
+    1087 \
+    8080 \
+    8118 \
+    20171 \
+    20172 \
+    6152
+  do
+    add_candidate \
+      "http://127.0.0.1:${p}" \
+      "常见 HTTP 端口"
   done
 
-  for p in 7897 7890 7891 1080 10808 20170 20171 6153; do
-    add_candidate "socks5h://127.0.0.1:${p}" "常见 SOCKS 端口"
+  for p in \
+    7897 \
+    7890 \
+    7891 \
+    1080 \
+    10808 \
+    20170 \
+    20171 \
+    6153
+  do
+    add_candidate \
+      "socks5h://127.0.0.1:${p}" \
+      "常见 SOCKS 端口"
   done
 }
 
 test_local_proxy() {
   local url="$1"
-  curl -fsS --connect-timeout 2 --max-time 8 -x "$url" "$TEST_URL" >/dev/null 2>&1
+
+  curl \
+    -fsS \
+    --connect-timeout 2 \
+    --max-time 8 \
+    -x "$url" \
+    "$TEST_URL" \
+    >/dev/null 2>&1
 }
 
 test_remote_proxy() {
   local url="$1"
+
   ssh_run bash -s <<EOF >/dev/null 2>&1
 set -euo pipefail
+
 if command -v curl >/dev/null 2>&1; then
-  curl -fsS --connect-timeout 3 --max-time 12 -x "$url" "$TEST_URL" >/dev/null
+  curl \
+    -fsS \
+    --connect-timeout 3 \
+    --max-time 12 \
+    -x "$url" \
+    "$TEST_URL" \
+    >/dev/null
+
 elif command -v python3 >/dev/null 2>&1; then
   python3 - <<PY
 import urllib.request
+
 proxy = "$url"
+
 opener = urllib.request.build_opener(
-    urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    urllib.request.ProxyHandler(
+        {
+            "http": proxy,
+            "https": proxy,
+        }
+    )
 )
+
 with opener.open("$TEST_URL", timeout=12) as r:
     r.read()
 PY
+
 else
   exit 1
 fi
@@ -305,56 +517,66 @@ EOF
 }
 
 prepare_target() {
-  [ -n "$TARGET" ] || die "目标机 IP 不能为空"
+  [ -n "$TARGET" ] ||
+    die "未指定目标主机地址。"
+
+  [ -n "$SSH_USER" ] ||
+    die "未指定 SSH 用户。请使用 -u/--user 指定。"
+
+  [[ "$TARGET" =~ ^[A-Za-z0-9._:-]+$ ]] ||
+    die "目标主机地址格式无效。"
+
+  [[ "$SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9._-]*\$?$ ]] ||
+    die "SSH 用户名格式无效。"
+
+  [[ "$SSH_PORT" =~ ^[0-9]+$ ]] &&
+    [ "$SSH_PORT" -ge 1 ] &&
+    [ "$SSH_PORT" -le 65535 ] ||
+    die "SSH 端口必须为 1-65535 之间的整数。"
 
   LOCAL_IP="$(find_local_ip)"
-  [ -n "$LOCAL_IP" ] || die "无法自动找到通往 ${TARGET} 的本机 IP，请用 -l 指定"
 
-  step "目标机确认"
-  log "目标机 IP：${TARGET}"
-  log "SSH 用户：${SSH_USER}"
-  log "SSH 端口：${SSH_PORT}"
-  log "目标机访问本机代理时使用：${LOCAL_IP}"
+  [ -n "$LOCAL_IP" ] ||
+    die "无法自动确定访问 ${TARGET} 所使用的本机地址，请使用 -l/--local-ip 显式指定。"
 
-  if ping -c 1 -W 1 "$TARGET" >/dev/null 2>&1; then
-    ok "目标机可以 ping 通"
-  else
-    warn "目标机 ping 不通，继续测试 SSH"
-  fi
+  log "目标主机：$(ssh_target)"
+
+  ping -c 1 -W 1 "$TARGET" \
+    >/dev/null 2>&1 || true
 
   start_ssh_master
 }
 
 select_proxy() {
   collect_candidates
-  [ "${#CANDIDATES[@]}" -gt 0 ] || die "没有发现代理候选，请用 --proxy-url 或 -p 指定"
 
-  step "自动检测本机代理"
+  [ "${#CANDIDATES[@]}" -gt 0 ] ||
+    die "未检测到可用的本地代理候选。请使用 --proxy-url 或 -p/--proxy-port 显式指定。"
 
   local item local_url source remote_url
+
   for item in "${CANDIDATES[@]}"; do
     local_url="${item%%|*}"
     source="${item#*|}"
 
-    log "测试本机代理：${local_url}"
     if ! test_local_proxy "$local_url"; then
       continue
     fi
-    ok "本机代理可用：${local_url}"
 
     remote_url="$(remote_proxy_url "$local_url")"
-    log "测试目标机访问代理：${remote_url}"
+
     if test_remote_proxy "$remote_url"; then
       SEL_LOCAL_URL="$local_url"
       SEL_REMOTE_URL="$remote_url"
       SEL_SCHEME="$(proxy_scheme "$local_url")"
       SEL_SOURCE="$source"
-      ok "选择代理：${SEL_REMOTE_URL}"
+
+      ok "代理服务可用：${SEL_REMOTE_URL}"
       return 0
     fi
   done
 
-  die "没有找到目标机可访问的代理。请确认本机代理已开启 Allow LAN / 允许局域网连接，或用 --proxy-url 手动指定。"
+  die "未找到目标主机可访问的代理服务。请确认代理已允许局域网访问（Allow LAN），或使用 --proxy-url 显式指定代理地址。"
 }
 
 remote_sudo_nopasswd() {
@@ -364,67 +586,93 @@ remote_sudo_nopasswd() {
 remote_sudo_prime() {
   local reason="${1:-执行 root 操作}" pw
 
-  # 已经验证过 sudo，则后续 root 操作复用本地内存里的 sudo 密码，
-  # 通过 sudo -S 传给目标机；不会再次向用户询问。
   if [ "${SUDO_PRIMED:-no}" = "yes" ]; then
     return 0
   fi
 
-  # 如果目标机允许免密 sudo，也视为已经准备好。
   if remote_sudo_nopasswd; then
     SUDO_PRIMED="yes"
     SUDO_PASSWORD=""
     return 0
   fi
 
-  has_tty || die "${reason} 需要目标机 sudo 权限，但当前没有交互终端，无法输入 sudo 密码"
+  if [ "${AUTH_PASSWORD_CAPTURED:-no}" = "yes" ] &&
+     [ -n "${AUTH_PASSWORD:-}" ]; then
 
-  log "${reason} 需要目标机 sudo 权限；全流程只会在这里输入一次 sudo 密码"
-  printf '[sudo] password for %s@%s: ' "$SSH_USER" "$TARGET" >/dev/tty
+    if printf '%s\n' "$AUTH_PASSWORD" |
+      ssh_run 'sudo -S -p "" -v >/dev/null 2>&1'
+    then
+      SUDO_PASSWORD="$AUTH_PASSWORD"
+      AUTH_PASSWORD=""
+      SUDO_PRIMED="yes"
+      return 0
+    fi
+
+    die "单次密码认证无法完成 sudo 验证。当前 SSH 密码与 sudo 密码可能不同；请统一认证密码，或配置 SSH 公钥认证后重新执行。"
+  fi
+
+  has_tty ||
+    die "${reason} 需要目标主机 sudo 权限，但当前会话无可用交互终端，无法获取认证信息。"
+
+  printf '[AUTH] 请输入 sudo 密码：' >/dev/tty
+
   stty -echo </dev/tty
   IFS= read -r pw </dev/tty || pw=""
   stty echo </dev/tty
+
   printf '\n' >/dev/tty
 
-  # 用 sudo -S 从 stdin 接收密码。这样不依赖 sudo 的 tty ticket，
-  # 后续即使是新的 SSH/PTY，也可以复用同一个已读取的密码。
-  if printf '%s\n' "$pw" | ssh_run 'sudo -S -p "" -v >/dev/null 2>&1'; then
+  if printf '%s\n' "$pw" |
+    ssh_run 'sudo -S -p "" -v >/dev/null 2>&1'
+  then
     SUDO_PASSWORD="$pw"
     SUDO_PRIMED="yes"
   else
     SUDO_PASSWORD=""
-    die "sudo 验证失败：请确认 ${SSH_USER} 在目标机上有 sudo 权限，并且密码正确"
+    die "sudo 认证失败。请确认用户 ${SSH_USER} 具有 sudo 权限，并检查所输入的密码。"
   fi
 }
 
 upload_remote_script() {
   local local_file="$1" remote_tmp
-  remote_tmp="$(ssh_run 'mktemp /tmp/borrow-net-root.XXXXXX.sh')"
+
+  remote_tmp="$(
+    ssh_run \
+      'mktemp /tmp/borrow-net-root.XXXXXX.sh'
+  )"
+
   remote_tmp="${remote_tmp//$'\r'/}"
   remote_tmp="${remote_tmp//$'\n'/}"
-  [ -n "$remote_tmp" ] || die "无法在目标机创建临时脚本"
 
-  ssh_run "cat > '$remote_tmp' && chmod 600 '$remote_tmp'" < "$local_file"
+  [ -n "$remote_tmp" ] ||
+    die "无法在目标主机创建临时执行文件。"
+
+  ssh_run \
+    "cat > '$remote_tmp' && chmod 600 '$remote_tmp'" \
+    < "$local_file"
+
   printf '%s\n' "$remote_tmp"
 }
 
 run_uploaded_remote_root_script() {
   local remote_tmp="$1" quoted cmd
+
   quoted="$(printf '%q' "$remote_tmp")"
 
-  # 如果是免密 sudo，直接 sudo -n；否则用第一次读取的密码通过 sudo -S 执行。
-  # 业务脚本来自远端临时文件，不占用 stdin，因此 sudo -S 可以稳定读取密码。
   if [ -z "${SUDO_PASSWORD:-}" ]; then
     cmd="sudo -n bash $quoted; rc=\$?; rm -f $quoted; exit \$rc"
     ssh_run "$cmd"
   else
     cmd="sudo -S -p '' bash $quoted; rc=\$?; rm -f $quoted; exit \$rc"
-    printf '%s\n' "$SUDO_PASSWORD" | ssh_run "$cmd"
+
+    printf '%s\n' "$SUDO_PASSWORD" |
+      ssh_run "$cmd"
   fi
 }
 
 run_remote_root_required() {
   local reason="$1" tmp remote_tmp
+
   tmp="$(mktemp)"
   cat > "$tmp"
 
@@ -432,24 +680,781 @@ run_remote_root_required() {
 
   remote_tmp="$(upload_remote_script "$tmp")"
   rm -f "$tmp"
+
   run_uploaded_remote_root_script "$remote_tmp"
+}
+
+install_auto_clear() {
+  run_remote_root_required "准备自动清理机制" <<EOF
+set -euo pipefail
+
+instance="borrow-net-auto-clear@${SSH_USER}.service"
+
+if command -v systemctl >/dev/null 2>&1 &&
+   [ -d /run/systemd/system ]; then
+  systemctl stop "\$instance" \
+    >/dev/null 2>&1 || true
+
+  systemctl disable "\$instance" \
+    >/dev/null 2>&1 || true
+fi
+
+if [ -x /usr/local/sbin/borrow-net-auto-clear ]; then
+  /usr/local/sbin/borrow-net-auto-clear \
+    clear-all "${SSH_USER}" \
+    >/dev/null 2>&1 || true
+fi
+EOF
+
+  run_remote_root_required "安装自动清理机制" <<'EOF'
+set -euo pipefail
+
+STATE_ROOT=/var/lib/borrow-net
+APT_FILE=/etc/apt/apt.conf.d/95borrow-net
+SELF=/usr/local/sbin/borrow-net-auto-clear
+UNIT_TEMPLATE=/etc/systemd/system/borrow-net-auto-clear@.service
+
+cat > "$SELF" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_ROOT=/var/lib/borrow-net
+APT_FILE=/etc/apt/apt.conf.d/95borrow-net
+SELF=/usr/local/sbin/borrow-net-auto-clear
+UNIT_TEMPLATE=/etc/systemd/system/borrow-net-auto-clear@.service
+
+action="${1:-}"
+user="${2:-}"
+applied_arg="${3:-}"
+
+[ -n "$action" ] || exit 2
+[ -n "$user" ] || exit 2
+
+home="$(
+  getent passwd "$user" 2>/dev/null |
+    awk -F: '{print $6}' ||
+    true
+)"
+
+[ -n "$home" ] || exit 0
+
+state="$STATE_ROOT/$user"
+instance="borrow-net-auto-clear@${user}.service"
+
+current_boot_id="$(
+  cat /proc/sys/kernel/random/boot_id \
+    2>/dev/null ||
+    true
+)"
+
+as_user() {
+  if command -v runuser >/dev/null 2>&1; then
+    runuser \
+      -u "$user" \
+      -- env HOME="$home" \
+      "$@"
+  else
+    return 127
+  fi
+}
+
+state_applied_url() {
+  if [ -f "$state/applied-url" ]; then
+    cat "$state/applied-url"
+  fi
+}
+
+cleanup_state_if_inactive() {
+  [ -d "$state" ] || return 0
+
+  if [ ! -e "$state/user.active" ] &&
+     [ ! -e "$state/apt.active" ]; then
+    rm -rf "$state"
+  fi
+}
+
+save_git_key() {
+  local key="$1" name="$2" values
+
+  rm -f \
+    "$state/$name.present" \
+    "$state/$name.values"
+
+  command -v git >/dev/null 2>&1 ||
+    return 0
+
+  if values="$(
+    as_user git config \
+      --global \
+      --get-all "$key" \
+      2>/dev/null
+  )"; then
+    : > "$state/$name.present"
+
+    printf '%s\n' "$values" \
+      > "$state/$name.values"
+  fi
+}
+
+restore_git_key_if_owned() {
+  local key="$1" name="$2"
+  local applied current value
+
+  command -v git >/dev/null 2>&1 ||
+    return 0
+
+  applied="$(state_applied_url)"
+
+  [ -n "$applied" ] ||
+    return 0
+
+  current="$(
+    as_user git config \
+      --global \
+      --get-all "$key" \
+      2>/dev/null ||
+      true
+  )"
+
+  [ "$current" = "$applied" ] ||
+    return 0
+
+  as_user git config \
+    --global \
+    --unset-all "$key" \
+    >/dev/null 2>&1 || true
+
+  if [ -e "$state/$name.present" ] &&
+     [ -f "$state/$name.values" ]; then
+
+    while IFS= read -r value ||
+          [ -n "$value" ]; do
+
+      as_user git config \
+        --global \
+        --add "$key" "$value" \
+        >/dev/null 2>&1 || true
+
+    done < "$state/$name.values"
+  fi
+}
+
+npm_user_get() {
+  local key="$1"
+
+  if as_user npm config \
+    get "$key" \
+    --location=user \
+    >/dev/null 2>&1
+  then
+    as_user npm config \
+      get "$key" \
+      --location=user \
+      2>/dev/null
+  else
+    as_user npm config \
+      get "$key" \
+      2>/dev/null
+  fi
+}
+
+npm_user_delete() {
+  local key="$1"
+
+  if as_user npm config \
+    delete "$key" \
+    --location=user \
+    >/dev/null 2>&1
+  then
+    return 0
+  fi
+
+  as_user npm config \
+    delete "$key" \
+    >/dev/null 2>&1 || true
+}
+
+npm_user_set() {
+  local key="$1" value="$2"
+
+  if as_user npm config \
+    set "$key" "$value" \
+    --location=user \
+    >/dev/null 2>&1
+  then
+    return 0
+  fi
+
+  as_user npm config \
+    set "$key" "$value" \
+    >/dev/null 2>&1 || true
+}
+
+save_npm_key() {
+  local key="$1" name="$2" value
+
+  rm -f \
+    "$state/$name.present" \
+    "$state/$name.value"
+
+  command -v npm >/dev/null 2>&1 ||
+    return 0
+
+  value="$(
+    npm_user_get "$key" ||
+    true
+  )"
+
+  case "$value" in
+    ""|null|undefined)
+      return 0
+      ;;
+  esac
+
+  : > "$state/$name.present"
+
+  printf '%s\n' "$value" \
+    > "$state/$name.value"
+}
+
+restore_npm_key_if_owned() {
+  local key="$1" name="$2"
+  local applied current value
+
+  command -v npm >/dev/null 2>&1 ||
+    return 0
+
+  applied="$(state_applied_url)"
+
+  [ -n "$applied" ] ||
+    return 0
+
+  current="$(
+    npm_user_get "$key" ||
+    true
+  )"
+
+  [ "$current" = "$applied" ] ||
+    return 0
+
+  npm_user_delete "$key"
+
+  if [ -e "$state/$name.present" ] &&
+     [ -f "$state/$name.value" ]; then
+
+    value="$(cat "$state/$name.value")"
+    npm_user_set "$key" "$value"
+  fi
+}
+
+clear_user_state() {
+  local rcname rc
+
+  [ -e "$state/user.active" ] ||
+    return 0
+
+  if [ -f "$home/.config/borrow-net.env" ] &&
+     grep -q \
+       '^# Generated by borrow-net v' \
+       "$home/.config/borrow-net.env" \
+       2>/dev/null
+  then
+
+    if [ -e "$state/env.existed" ] &&
+       [ -f "$state/borrow-net.env.backup" ]; then
+
+      mkdir -p "$home/.config"
+
+      cp -a \
+        "$state/borrow-net.env.backup" \
+        "$home/.config/borrow-net.env"
+
+      chown "$user" \
+        "$home/.config/borrow-net.env" \
+        2>/dev/null || true
+    else
+      rm -f "$home/.config/borrow-net.env"
+    fi
+  fi
+
+  for rcname in bashrc profile zshrc; do
+    rc="$home/.$rcname"
+
+    [ -f "$rc" ] ||
+      continue
+
+    sed -i \
+      '/# >>> borrow-net >>>/,/# <<< borrow-net <<</d' \
+      "$rc" ||
+      true
+
+    chown "$user" "$rc" \
+      2>/dev/null || true
+
+    if [ ! -s "$rc" ] &&
+       [ ! -e "$state/rc-$rcname.existed" ]; then
+      rm -f "$rc"
+    fi
+  done
+
+  restore_git_key_if_owned \
+    http.proxy \
+    git-http
+
+  restore_git_key_if_owned \
+    https.proxy \
+    git-https
+
+  restore_npm_key_if_owned \
+    proxy \
+    npm-proxy
+
+  restore_npm_key_if_owned \
+    https-proxy \
+    npm-https
+
+  rm -f "$state/user.active"
+
+  cleanup_state_if_inactive
+}
+
+prepare_user_state() {
+  local applied="$1"
+  local legacy_url=""
+  local current rcname rc
+
+  [ -n "$applied" ] ||
+    exit 2
+
+  clear_user_state || true
+
+  mkdir -p "$state"
+  chmod 700 "$STATE_ROOT" "$state"
+
+  if [ -f "$home/.config/borrow-net.env" ] &&
+     grep -q \
+       '^# Generated by borrow-net v' \
+       "$home/.config/borrow-net.env" \
+       2>/dev/null
+  then
+
+    legacy_url="$(
+      sed -n \
+        's/^export ALL_PROXY=//p' \
+        "$home/.config/borrow-net.env" |
+        head -n1
+    )"
+
+    rm -f "$home/.config/borrow-net.env"
+  fi
+
+  rm -f \
+    "$state/env.existed" \
+    "$state/borrow-net.env.backup" \
+    "$state/legacy-url"
+
+  if [ -f "$home/.config/borrow-net.env" ]; then
+    cp -a \
+      "$home/.config/borrow-net.env" \
+      "$state/borrow-net.env.backup"
+
+    : > "$state/env.existed"
+  fi
+
+  if [ -n "$legacy_url" ]; then
+    printf '%s\n' "$legacy_url" \
+      > "$state/legacy-url"
+  fi
+
+  for rcname in bashrc profile zshrc; do
+    rc="$home/.$rcname"
+
+    rm -f "$state/rc-$rcname.existed"
+
+    if [ -e "$rc" ]; then
+      : > "$state/rc-$rcname.existed"
+
+      sed -i \
+        '/# >>> borrow-net >>>/,/# <<< borrow-net <<</d' \
+        "$rc" \
+        2>/dev/null || true
+
+      chown "$user" "$rc" \
+        2>/dev/null || true
+    fi
+  done
+
+  if [ -n "$legacy_url" ]; then
+
+    if command -v git >/dev/null 2>&1; then
+      current="$(
+        as_user git config \
+          --global \
+          --get-all http.proxy \
+          2>/dev/null ||
+          true
+      )"
+
+      if [ "$current" = "$legacy_url" ]; then
+        as_user git config \
+          --global \
+          --unset-all http.proxy \
+          >/dev/null 2>&1 || true
+      fi
+
+      current="$(
+        as_user git config \
+          --global \
+          --get-all https.proxy \
+          2>/dev/null ||
+          true
+      )"
+
+      if [ "$current" = "$legacy_url" ]; then
+        as_user git config \
+          --global \
+          --unset-all https.proxy \
+          >/dev/null 2>&1 || true
+      fi
+    fi
+
+    if command -v npm >/dev/null 2>&1; then
+      current="$(
+        npm_user_get proxy ||
+        true
+      )"
+
+      [ "$current" = "$legacy_url" ] &&
+        npm_user_delete proxy
+
+      current="$(
+        npm_user_get https-proxy ||
+        true
+      )"
+
+      [ "$current" = "$legacy_url" ] &&
+        npm_user_delete https-proxy
+    fi
+  fi
+
+  save_git_key \
+    http.proxy \
+    git-http
+
+  save_git_key \
+    https.proxy \
+    git-https
+
+  save_npm_key \
+    proxy \
+    npm-proxy
+
+  save_npm_key \
+    https-proxy \
+    npm-https
+
+  printf '%s\n' "$applied" \
+    > "$state/applied-url"
+
+  printf '%s\n' "$current_boot_id" \
+    > "$state/boot-id"
+
+  : > "$state/user.active"
+}
+
+clear_apt_state() {
+  [ -e "$state/apt.active" ] ||
+    return 0
+
+  if [ -f "$APT_FILE" ] &&
+     grep -q \
+       'Generated by borrow-net' \
+       "$APT_FILE" \
+       2>/dev/null
+  then
+
+    if [ -e "$state/apt.existed" ] &&
+       [ -f "$state/apt.backup" ]; then
+
+      cp -a \
+        "$state/apt.backup" \
+        "$APT_FILE"
+    else
+      rm -f "$APT_FILE"
+    fi
+  fi
+
+  rm -f "$state/apt.active"
+
+  cleanup_state_if_inactive
+}
+
+prepare_apt_state() {
+  local applied="$1"
+  local legacy_url=""
+
+  [ -n "$applied" ] ||
+    exit 2
+
+  clear_apt_state || true
+
+  mkdir -p "$state"
+  chmod 700 "$STATE_ROOT" "$state"
+
+  rm -f \
+    "$state/apt.existed" \
+    "$state/apt.backup"
+
+  if [ -f "$state/legacy-url" ]; then
+    legacy_url="$(cat "$state/legacy-url")"
+  fi
+
+  if [ -e "$APT_FILE" ]; then
+
+    if grep -q \
+         'Generated by borrow-net' \
+         "$APT_FILE" \
+         2>/dev/null ||
+       {
+         [ -n "$legacy_url" ] &&
+         grep -qF \
+           "$legacy_url" \
+           "$APT_FILE" \
+           2>/dev/null
+       }
+    then
+      rm -f "$APT_FILE"
+    else
+      cp -a \
+        "$APT_FILE" \
+        "$state/apt.backup"
+
+      : > "$state/apt.existed"
+    fi
+  fi
+
+  printf '%s\n' "$applied" \
+    > "$state/applied-url"
+
+  if [ ! -f "$state/boot-id" ]; then
+    printf '%s\n' "$current_boot_id" \
+      > "$state/boot-id"
+  fi
+
+  : > "$state/apt.active"
+}
+
+clear_all() {
+  clear_user_state || true
+  clear_apt_state || true
+  cleanup_state_if_inactive
+}
+
+remove_instance_artifacts() {
+  find /etc/systemd/system \
+    -type l \
+    -name "$instance" \
+    -delete \
+    2>/dev/null || true
+
+  if [ -d "$STATE_ROOT" ] &&
+     ! find "$STATE_ROOT" \
+       -mindepth 1 \
+       -maxdepth 1 \
+       -print \
+       -quit |
+       grep -q .
+  then
+    rmdir "$STATE_ROOT" \
+      2>/dev/null || true
+  fi
+
+  if [ ! -d "$STATE_ROOT" ] &&
+     ! find /etc/systemd/system \
+       -type l \
+       -name 'borrow-net-auto-clear@*.service' \
+       -print \
+       -quit \
+       2>/dev/null |
+       grep -q .
+  then
+    rm -f "$UNIT_TEMPLATE"
+    rm -f "$SELF"
+  fi
+}
+
+clear_and_uninstall() {
+  clear_all
+  remove_instance_artifacts
+}
+
+watch_lifecycle() {
+  local saved_boot_id=""
+  local child_pid=""
+
+  if [ ! -e "$state/user.active" ] &&
+     [ ! -e "$state/apt.active" ]; then
+
+    clear_and_uninstall
+    exit 0
+  fi
+
+  if [ -f "$state/boot-id" ]; then
+    saved_boot_id="$(cat "$state/boot-id")"
+  fi
+
+  if [ -z "$saved_boot_id" ] ||
+     [ "$saved_boot_id" != "$current_boot_id" ]; then
+
+    clear_and_uninstall
+    exit 0
+  fi
+
+  on_stop() {
+    trap - TERM INT HUP
+
+    if [ -n "$child_pid" ]; then
+      kill "$child_pid" \
+        >/dev/null 2>&1 || true
+
+      wait "$child_pid" \
+        >/dev/null 2>&1 || true
+
+      child_pid=""
+    fi
+
+    clear_and_uninstall || true
+    exit 0
+  }
+
+  trap on_stop TERM INT HUP
+
+  while :; do
+    sleep 86400 &
+    child_pid=$!
+
+    wait "$child_pid" ||
+      true
+
+    child_pid=""
+  done
+}
+
+case "$action" in
+  prepare-user)
+    prepare_user_state "$applied_arg"
+    ;;
+
+  prepare-apt)
+    prepare_apt_state "$applied_arg"
+    ;;
+
+  clear-user)
+    clear_user_state
+    ;;
+
+  clear-apt)
+    clear_apt_state
+    ;;
+
+  clear-all)
+    clear_all
+    ;;
+
+  clear-and-uninstall)
+    clear_and_uninstall
+    ;;
+
+  watch)
+    watch_lifecycle
+    ;;
+
+  *)
+    exit 2
+    ;;
+esac
+SH
+
+chmod 755 "$SELF"
+
+mkdir -p "$STATE_ROOT"
+chmod 700 "$STATE_ROOT"
+
+cat > "$UNIT_TEMPLATE" <<'UNIT'
+[Unit]
+Description=One-shot borrow-net lifecycle cleanup for user %i
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/borrow-net-auto-clear watch %i
+Restart=no
+TimeoutStopSec=30s
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+if command -v systemctl >/dev/null 2>&1 &&
+   [ -d /run/systemd/system ]; then
+
+  systemctl daemon-reload \
+    >/dev/null 2>&1
+else
+  echo "目标系统未运行 systemd，无法部署代理自动清理机制。" >&2
+  exit 1
+fi
+EOF
+
+  run_remote_root_required "启用自动清理机制" <<EOF
+set -euo pipefail
+
+instance="borrow-net-auto-clear@${SSH_USER}.service"
+
+systemctl enable "\$instance" \
+  >/dev/null 2>&1
+
+/usr/local/sbin/borrow-net-auto-clear \
+  prepare-user \
+  "${SSH_USER}" \
+  "${SEL_REMOTE_URL}" \
+  >/dev/null 2>&1
+
+systemctl start "\$instance" \
+  >/dev/null 2>&1
+EOF
+
+  ok "自动清理已启用"
 }
 
 sync_target_time() {
   case "$SYNC_TIME_MODE" in
     no)
-      warn "跳过目标机时间同步"
       return 0
       ;;
-    auto|yes) ;;
-    *) die "SYNC_TIME_MODE 只能是 auto / yes / no" ;;
+
+    auto|yes)
+      ;;
+
+    *)
+      die "无效的时间同步模式。SYNC_TIME_MODE 仅支持 auto、yes 或 no。"
+      ;;
   esac
 
-  step "同步目标机时间"
-
   local local_epoch remote_epoch diff absdiff
+
   local_epoch="$(date -u +%s)"
-  remote_epoch="$(ssh_run date -u +%s 2>/dev/null || printf '0')"
+
+  remote_epoch="$(
+    ssh_run date -u +%s \
+      2>/dev/null ||
+      printf '0'
+  )"
+
   remote_epoch="${remote_epoch//$'\r'/}"
   remote_epoch="${remote_epoch//$'\n'/}"
 
@@ -458,55 +1463,68 @@ sync_target_time() {
   fi
 
   diff=$((local_epoch - remote_epoch))
+
   if [ "$diff" -lt 0 ]; then
     absdiff=$((-diff))
   else
     absdiff="$diff"
   fi
 
-  log "本机 UTC epoch：${local_epoch}"
-  log "目标机 UTC epoch：${remote_epoch}"
+  if [ "$SYNC_TIME_MODE" = "auto" ]; then
+    if [ "$absdiff" -gt 300 ]; then
+      warn "目标主机时间偏差超过 5 分钟，可能影响 HTTPS 访问；如需同步请使用 --sync-time。"
+    fi
 
-  if [ "$SYNC_TIME_MODE" = "auto" ] && [ "$absdiff" -le 300 ]; then
-    ok "目标机时间偏差 ${absdiff}s，不需要同步"
     return 0
   fi
 
-  run_remote_root_required "同步目标机时间" <<EOF
+  run_remote_root_required "同步目标主机时间" <<EOF
 set -euo pipefail
-date -u -s '@${local_epoch}' >/dev/null
+
+date -u -s '@${local_epoch}' \
+  >/dev/null
+
 if command -v timedatectl >/dev/null 2>&1; then
-  timedatectl set-ntp true >/dev/null 2>&1 || true
+  timedatectl set-ntp true \
+    >/dev/null 2>&1 || true
 fi
 EOF
 
-  ok "目标机时间已同步到本机当前时间"
+  ok "目标主机时间已同步"
 }
 
 run_remote_root() {
   local tmp remote_tmp
+
   tmp="$(mktemp)"
   cat > "$tmp"
 
   case "$APT_MODE" in
     no)
-      warn "跳过 apt 代理"
       rm -f "$tmp"
       return 0
       ;;
-    yes|ask) ;;
-    *) rm -f "$tmp"; die "APT_MODE 只能是 ask / yes / no" ;;
+
+    yes|ask)
+      ;;
+
+    *)
+      rm -f "$tmp"
+      die "无效的 APT 处理模式。APT_MODE 仅支持 ask、yes 或 no。"
+      ;;
   esac
 
   if [ "${SEL_SCHEME:-http}" = "socks5h" ]; then
-    warn "SOCKS 代理不适合 apt，已跳过 apt 代理"
+    log "SOCKS 模式下不配置 APT 代理"
     rm -f "$tmp"
     return 0
   fi
 
   if [ "$APT_MODE" = "ask" ]; then
-    if ! ask_yes_no "是否配置 / 清除 apt 代理？这需要输入目标机 sudo 密码" "Y"; then
-      warn "跳过 apt 代理"
+    if ! ask_yes_no \
+      "是否同时处理 APT 系统级代理配置？该操作需要 sudo 权限" \
+      "Y"
+    then
       rm -f "$tmp"
       return 0
     fi
@@ -516,11 +1534,16 @@ run_remote_root() {
 
   remote_tmp="$(upload_remote_script "$tmp")"
   rm -f "$tmp"
+
   run_uploaded_remote_root_script "$remote_tmp"
+
+  APT_HANDLED="yes"
 }
 
 write_user_proxy() {
-  local url="$SEL_REMOTE_URL" scheme="$SEL_SCHEME"
+  local url="$SEL_REMOTE_URL"
+  local scheme="$SEL_SCHEME"
+
   ssh_run bash -s <<EOF
 set -euo pipefail
 
@@ -545,9 +1568,17 @@ fi
 
 chmod 600 "\$HOME/.config/borrow-net.env"
 
-for rc in "\$HOME/.bashrc" "\$HOME/.profile" "\$HOME/.zshrc"; do
+for rc in \
+  "\$HOME/.bashrc" \
+  "\$HOME/.profile" \
+  "\$HOME/.zshrc"
+do
   touch "\$rc"
-  if ! grep -qF '# >>> borrow-net >>>' "\$rc"; then
+
+  if ! grep -qF \
+    '# >>> borrow-net >>>' \
+    "\$rc"
+  then
     cat >> "\$rc" <<'RC'
 
 # >>> borrow-net >>>
@@ -558,13 +1589,45 @@ RC
 done
 
 if command -v git >/dev/null 2>&1; then
-  git config --global http.proxy "${url}" >/dev/null 2>&1 || true
-  git config --global https.proxy "${url}" >/dev/null 2>&1 || true
+  git config \
+    --global \
+    --replace-all \
+    http.proxy \
+    "${url}" \
+    >/dev/null 2>&1 || true
+
+  git config \
+    --global \
+    --replace-all \
+    https.proxy \
+    "${url}" \
+    >/dev/null 2>&1 || true
 fi
 
-if [ "${scheme}" != "socks5h" ] && command -v npm >/dev/null 2>&1; then
-  npm config set proxy "${url}" >/dev/null 2>&1 || true
-  npm config set https-proxy "${url}" >/dev/null 2>&1 || true
+if [ "${scheme}" != "socks5h" ] &&
+   command -v npm >/dev/null 2>&1; then
+
+  npm config set \
+    proxy \
+    "${url}" \
+    --location=user \
+    >/dev/null 2>&1 ||
+    npm config set \
+      proxy \
+      "${url}" \
+      >/dev/null 2>&1 ||
+    true
+
+  npm config set \
+    https-proxy \
+    "${url}" \
+    --location=user \
+    >/dev/null 2>&1 ||
+    npm config set \
+      https-proxy \
+      "${url}" \
+      >/dev/null 2>&1 ||
+    true
 fi
 EOF
 }
@@ -572,79 +1635,297 @@ EOF
 write_apt_proxy() {
   run_remote_root <<EOF
 set -euo pipefail
+
+/usr/local/sbin/borrow-net-auto-clear \
+  prepare-apt \
+  "${SSH_USER}" \
+  "${SEL_REMOTE_URL}" \
+  >/dev/null 2>&1
+
 mkdir -p /etc/apt/apt.conf.d
+
 cat > /etc/apt/apt.conf.d/95borrow-net <<APT
+// Generated by borrow-net v${VERSION}
 Acquire::http::Proxy "${SEL_REMOTE_URL}/";
 Acquire::https::Proxy "${SEL_REMOTE_URL}/";
 APT
-chmod 644 /etc/apt/apt.conf.d/95borrow-net
+
+chmod 644 \
+  /etc/apt/apt.conf.d/95borrow-net
 EOF
 }
 
-clear_user_proxy() {
+clear_all_proxy_and_uninstall() {
+  if ssh_run \
+    'test -x /usr/local/sbin/borrow-net-auto-clear' \
+    >/dev/null 2>&1
+  then
+
+    run_remote_root_required \
+      "清除代理配置" <<EOF
+set -euo pipefail
+
+instance="borrow-net-auto-clear@${SSH_USER}.service"
+
+systemctl stop "\$instance" \
+  >/dev/null 2>&1 || true
+
+if [ -x /usr/local/sbin/borrow-net-auto-clear ]; then
+  /usr/local/sbin/borrow-net-auto-clear \
+    clear-and-uninstall \
+    "${SSH_USER}" \
+    >/dev/null 2>&1 || true
+fi
+
+systemctl daemon-reload \
+  >/dev/null 2>&1 || true
+EOF
+
+    return 0
+  fi
+
   ssh_run bash -s <<'EOF'
 set -euo pipefail
 
-rm -f "$HOME/.config/borrow-net.env"
+if [ -f "$HOME/.config/borrow-net.env" ] &&
+   grep -q \
+     '^# Generated by borrow-net v' \
+     "$HOME/.config/borrow-net.env" \
+     2>/dev/null
+then
+  legacy_url="$(
+    sed -n \
+      's/^export ALL_PROXY=//p' \
+      "$HOME/.config/borrow-net.env" |
+      head -n1
+  )"
 
-for rc in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.zshrc"; do
-  [ -f "$rc" ] || continue
-  sed -i '/# >>> borrow-net >>>/,/# <<< borrow-net <<</d' "$rc"
+  rm -f "$HOME/.config/borrow-net.env"
+else
+  legacy_url=""
+fi
+
+for rc in \
+  "$HOME/.bashrc" \
+  "$HOME/.profile" \
+  "$HOME/.zshrc"
+do
+  [ -f "$rc" ] ||
+    continue
+
+  sed -i \
+    '/# >>> borrow-net >>>/,/# <<< borrow-net <<</d' \
+    "$rc"
 done
 
-if command -v npm >/dev/null 2>&1; then
-  npm config delete proxy >/dev/null 2>&1 || true
-  npm config delete https-proxy >/dev/null 2>&1 || true
+if [ -n "$legacy_url" ] &&
+   command -v git >/dev/null 2>&1; then
+
+  if [ "$(
+    git config \
+      --global \
+      --get-all http.proxy \
+      2>/dev/null ||
+      true
+  )" = "$legacy_url" ]; then
+    git config \
+      --global \
+      --unset-all http.proxy \
+      >/dev/null 2>&1 ||
+      true
+  fi
+
+  if [ "$(
+    git config \
+      --global \
+      --get-all https.proxy \
+      2>/dev/null ||
+      true
+  )" = "$legacy_url" ]; then
+    git config \
+      --global \
+      --unset-all https.proxy \
+      >/dev/null 2>&1 ||
+      true
+  fi
 fi
 
-if command -v git >/dev/null 2>&1; then
-  git config --global --unset-all http.proxy >/dev/null 2>&1 || true
-  git config --global --unset-all https.proxy >/dev/null 2>&1 || true
+if [ -n "$legacy_url" ] &&
+   command -v npm >/dev/null 2>&1; then
+
+  if [ "$(
+    npm config get proxy \
+      2>/dev/null ||
+      true
+  )" = "$legacy_url" ]; then
+    npm config delete proxy \
+      >/dev/null 2>&1 ||
+      true
+  fi
+
+  if [ "$(
+    npm config get https-proxy \
+      2>/dev/null ||
+      true
+  )" = "$legacy_url" ]; then
+    npm config delete https-proxy \
+      >/dev/null 2>&1 ||
+      true
+  fi
 fi
 EOF
+
+  if [ "$APT_MODE" != "no" ]; then
+    run_remote_root_required \
+      "清除旧版 APT 代理" <<'EOF'
+set -euo pipefail
+
+if [ -f /etc/apt/apt.conf.d/95borrow-net ] &&
+   grep -q \
+     'borrow-net' \
+     /etc/apt/apt.conf.d/95borrow-net \
+     2>/dev/null
+then
+  rm -f /etc/apt/apt.conf.d/95borrow-net
+fi
+
+rm -f \
+  /etc/systemd/system/borrow-net-auto-clear@.service
+
+find /etc/systemd/system \
+  -type l \
+  -name 'borrow-net-auto-clear@*.service' \
+  -delete \
+  2>/dev/null || true
+
+rm -f \
+  /usr/local/sbin/borrow-net-auto-clear
+
+rm -rf \
+  /var/lib/borrow-net
+
+systemctl daemon-reload \
+  >/dev/null 2>&1 || true
+EOF
+  fi
 }
 
-clear_apt_proxy() {
-  SEL_SCHEME="http"
-  run_remote_root <<'EOF'
+rollback_enable() {
+  set +e
+
+  if [ "${SSH_MASTER_STARTED:-no}" = "yes" ] &&
+     [ "${SUDO_PRIMED:-no}" = "yes" ]; then
+
+    local tmp remote_tmp
+
+    tmp="$(mktemp)"
+
+    cat >"$tmp" <<EOF
 set -euo pipefail
-rm -f /etc/apt/apt.conf.d/95borrow-net
+
+instance="borrow-net-auto-clear@${SSH_USER}.service"
+
+systemctl stop "\$instance" \
+  >/dev/null 2>&1 || true
+
+if [ -x /usr/local/sbin/borrow-net-auto-clear ]; then
+  /usr/local/sbin/borrow-net-auto-clear \
+    clear-and-uninstall \
+    "${SSH_USER}" \
+    >/dev/null 2>&1 || true
+fi
+
+systemctl daemon-reload \
+  >/dev/null 2>&1 || true
 EOF
+
+    remote_tmp="$(
+      upload_remote_script "$tmp" \
+        2>/dev/null ||
+        true
+    )"
+
+    rm -f "$tmp"
+
+    if [ -n "$remote_tmp" ]; then
+      run_uploaded_remote_root_script "$remote_tmp" \
+        >/dev/null 2>&1 ||
+        true
+    fi
+  fi
+
+  set -e
 }
 
 remote_online_tests() {
-  step "目标机外网测试"
-
   local urls url i ok_count
+
   urls="${TEST_URL} ${EXTRA_TEST_URLS}"
   ok_count=0
 
   for url in $urls; do
-    log "测试：${url}"
+
     for i in $(seq 1 "$TRIES"); do
-      if ssh_run bash -s <<EOF >/tmp/borrow_net_test.out 2>/tmp/borrow_net_test.err
+
+      if ssh_run bash -s <<EOF >/dev/null 2>&1
 set -euo pipefail
+
 set -a
-[ -f "\$HOME/.config/borrow-net.env" ] && . "\$HOME/.config/borrow-net.env"
+
+[ -f "\$HOME/.config/borrow-net.env" ] &&
+  . "\$HOME/.config/borrow-net.env"
+
 set +a
 
 if command -v curl >/dev/null 2>&1; then
-  curl -fsS --connect-timeout 3 --max-time 12 "$url" | head -c 120
+
+  curl \
+    -fsS \
+    --connect-timeout 3 \
+    --max-time 12 \
+    "$url" |
+    head -c 120
+
 elif command -v python3 >/dev/null 2>&1; then
+
   python3 - <<PY
-import os, urllib.request
-proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
-handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy}) if proxy else urllib.request.ProxyHandler({})
+import os
+import urllib.request
+
+proxy = (
+    os.environ.get("HTTP_PROXY")
+    or os.environ.get("http_proxy")
+    or os.environ.get("ALL_PROXY")
+    or os.environ.get("all_proxy")
+)
+
+handler = (
+    urllib.request.ProxyHandler(
+        {
+            "http": proxy,
+            "https": proxy,
+        }
+    )
+    if proxy
+    else urllib.request.ProxyHandler({})
+)
+
 opener = urllib.request.build_opener(handler)
+
 with opener.open("$url", timeout=12) as r:
-    print(r.read(120).decode("utf-8", "ignore"))
+    print(
+        r.read(120).decode(
+            "utf-8",
+            "ignore",
+        )
+    )
 PY
+
 else
   exit 1
 fi
 EOF
       then
-        ok "可访问：${url}"
         ok_count=$((ok_count + 1))
         break
       fi
@@ -655,52 +1936,74 @@ EOF
     done
   done
 
-  rm -f /tmp/borrow_net_test.out /tmp/borrow_net_test.err
+  [ "$ok_count" -gt 0 ] ||
+    die "目标主机外网访问验证失败。"
 
-  [ "$ok_count" -gt 0 ] || die "目标机外网测试失败"
-  ok "目标机已经具备外网访问能力"
+  ok "网络验证通过"
 }
 
 enable_flow() {
+  step "启用代理"
+
   prepare_target
   sync_target_time
   select_proxy
 
-  step "写入目标机代理配置"
+  ENABLE_ROLLBACK_ARMED="yes"
+
+  install_auto_clear
+
   write_user_proxy
-  ok "用户级代理已写入"
+  ok "用户代理已应用"
+
+  APT_HANDLED="no"
 
   write_apt_proxy
 
+  if [ "$APT_HANDLED" = "yes" ]; then
+    ok "APT 代理已应用"
+  fi
+
   remote_online_tests
 
+  ENABLE_ROLLBACK_ARMED="no"
+
   echo
-  ok "代理配置完成"
+  ok "代理已启用"
 }
 
 clear_flow() {
+  step "清除代理"
+
   prepare_target
 
-  step "清除目标机代理配置"
-  clear_user_proxy
-  ok "用户级代理已清除"
-
-  clear_apt_proxy
+  clear_all_proxy_and_uninstall
 
   echo
-  ok "清除完成"
+  ok "代理配置及 borrow-net 组件已清除"
 }
 
 menu_enable() {
-  TARGET="$(read_tty "目标机 IP")"
-  SSH_USER="$(read_tty "SSH 用户名" "$SSH_USER")"
-  SSH_PORT="$(read_tty "SSH 端口" "$SSH_PORT")"
+  TARGET="$(
+    read_required_tty \
+      "请输入目标主机 IP"
+  )"
 
-  if ask_yes_no "是否手动指定代理 URL，例如 http://127.0.0.1:7897" "N"; then
-    PROXY_URL_MANUAL="$(read_tty "代理 URL" "http://127.0.0.1:7897")"
-  fi
+  SSH_USER="$(
+    read_required_tty \
+      "请输入 SSH 用户名"
+  )"
 
-  if ask_yes_no "是否同时配置 apt 代理" "Y"; then
+  SSH_PORT="$(
+    read_tty \
+      "请输入 SSH 端口" \
+      "$SSH_PORT"
+  )"
+
+  if ask_yes_no \
+    "是否配置 APT 代理" \
+    "Y"
+  then
     APT_MODE="yes"
   else
     APT_MODE="no"
@@ -710,75 +2013,106 @@ menu_enable() {
 }
 
 menu_clear() {
-  TARGET="$(read_tty "目标机 IP")"
-  SSH_USER="$(read_tty "SSH 用户名" "$SSH_USER")"
-  SSH_PORT="$(read_tty "SSH 端口" "$SSH_PORT")"
+  TARGET="$(
+    read_required_tty \
+      "请输入目标主机 IP"
+  )"
 
-  if ask_yes_no "是否同时清除 apt 代理" "Y"; then
-    APT_MODE="yes"
-  else
-    APT_MODE="no"
-  fi
+  SSH_USER="$(
+    read_required_tty \
+      "请输入 SSH 用户名"
+  )"
+
+  SSH_PORT="$(
+    read_tty \
+      "请输入 SSH 端口" \
+      "$SSH_PORT"
+  )"
+
+  APT_MODE="yes"
 
   clear_flow
 }
 
 menu() {
-  has_tty || die "当前没有交互终端，请用命令行模式运行"
+  has_tty ||
+    die "当前会话无可用交互终端，请使用命令行参数模式执行。"
 
   cat >/dev/tty <<MENU
 
 borrow-net v${VERSION}
-请选择功能：
-  1) 代理
-  2) 消除
+
+请选择操作：
+  1) 启用代理
+  2) 清除代理
   0) 退出
 
 MENU
 
   local choice
-  choice="$(read_tty "请输入序号" "1")"
+
+  choice="$(
+    read_tty \
+      "请选择" \
+      "1"
+  )"
 
   case "$choice" in
     1)
       menu_enable
       exit 0
       ;;
+
     2)
       menu_clear
       exit 0
       ;;
+
     0|3|q|Q|exit)
       exit 0
       ;;
+
     *)
-      die "无效选择"
+      die "无效的操作选项。"
       ;;
   esac
 }
 
 parse_args() {
   case "${1:-menu}" in
+
     menu|wizard)
       MODE="menu"
       shift || true
       ;;
+
     enable)
       MODE="enable"
       shift
+
       TARGET="${1:-}"
-      [ $# -gt 0 ] && shift
+
+      if [ $# -gt 0 ]; then
+        shift
+      fi
       ;;
+
     clear)
       MODE="clear"
       shift
+
       TARGET="${1:-}"
-      [ $# -gt 0 ] && shift
+
+      if [ $# -gt 0 ]; then
+        shift
+      fi
       ;;
+
     -h|--help|help)
       usage
       exit 0
       ;;
+
     *)
       usage
       exit 1
@@ -787,18 +2121,65 @@ parse_args() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      -u|--user) SSH_USER="$2"; shift 2 ;;
-      -P|--ssh-port) SSH_PORT="$2"; shift 2 ;;
-      --proxy-url) PROXY_URL_MANUAL="$2"; shift 2 ;;
-      -p|--proxy-port) PROXY_PORT_MANUAL="$2"; shift 2 ;;
-      --proxy-scheme) PROXY_SCHEME_MANUAL="$2"; shift 2 ;;
-      -l|--local-ip) LOCAL_IP_OVERRIDE="$2"; shift 2 ;;
-      --with-apt|--with-sudo) APT_MODE="yes"; shift ;;
-      --no-apt|--skip-sudo) APT_MODE="no"; shift ;;
-      --sync-time) SYNC_TIME_MODE="yes"; shift ;;
-      --no-sync-time) SYNC_TIME_MODE="no"; shift ;;
-      -h|--help) usage; exit 0 ;;
-      *) die "未知参数：$1" ;;
+
+      -u|--user)
+        SSH_USER="$2"
+        shift 2
+        ;;
+
+      -P|--ssh-port)
+        SSH_PORT="$2"
+        shift 2
+        ;;
+
+      --proxy-url)
+        PROXY_URL_MANUAL="$2"
+        shift 2
+        ;;
+
+      -p|--proxy-port)
+        PROXY_PORT_MANUAL="$2"
+        shift 2
+        ;;
+
+      --proxy-scheme)
+        PROXY_SCHEME_MANUAL="$2"
+        shift 2
+        ;;
+
+      -l|--local-ip)
+        LOCAL_IP_OVERRIDE="$2"
+        shift 2
+        ;;
+
+      --with-apt|--with-sudo)
+        APT_MODE="yes"
+        shift
+        ;;
+
+      --no-apt|--skip-sudo)
+        APT_MODE="no"
+        shift
+        ;;
+
+      --sync-time)
+        SYNC_TIME_MODE="yes"
+        shift
+        ;;
+
+      --no-sync-time)
+        SYNC_TIME_MODE="no"
+        shift
+        ;;
+
+      -h|--help)
+        usage
+        exit 0
+        ;;
+
+      *)
+        die "无法识别的命令行参数：$1"
+        ;;
     esac
   done
 }
@@ -812,14 +2193,18 @@ main() {
 
   parse_args "$@"
 
-  if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
-    warn "本脚本通常不需要用 sudo 运行；继续执行，但默认 SSH 用户已按 ${SUDO_USER} 处理"
-  fi
-
   case "$MODE" in
-    menu) menu ;;
-    enable) enable_flow ;;
-    clear) clear_flow ;;
+    menu)
+      menu
+      ;;
+
+    enable)
+      enable_flow
+      ;;
+
+    clear)
+      clear_flow
+      ;;
   esac
 }
 
